@@ -23,10 +23,12 @@ pip install -e .
 
 ```bash
 export TELEGRAM_BOT_TOKEN="<your-token>"
+export CRYPTOPAY_TOKEN="<crypto-pay-api-token>"  # enables inline payments
 python -m channel_admin.bot
 ```
 
-The sample bot exposes the following commands:
+The sample bot now guides the user through an emoji-rich inline menu. All core actions are available as buttons, while legacy
+slash commands remain for compatibility:
 
 - `/start` – register a new user after subscribing to sponsors (grants 100 energy once).
 - `/balance` – show the current amount of energy and golden cards.
@@ -39,7 +41,7 @@ The sample implementation uses in-memory storage for demonstration purposes.  In
 ## Tests
 
 ```bash
-pytest
+PYTHONPATH=src pytest
 ```
 
 ## Configuration
