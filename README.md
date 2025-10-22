@@ -21,9 +21,17 @@ pip install -e .
 
 ### Running the sample bot
 
+Create a `.env` file next to the project with the required tokens:
+
+```env
+TELEGRAM_BOT_TOKEN=<your-token>
+# Optional, enables inline payments
+CRYPTOPAY_TOKEN=<crypto-pay-api-token>
+```
+
+Then start the bot:
+
 ```bash
-export TELEGRAM_BOT_TOKEN="<your-token>"
-export CRYPTOPAY_TOKEN="<crypto-pay-api-token>"  # enables inline payments
 python -m channel_admin.bot
 ```
 
