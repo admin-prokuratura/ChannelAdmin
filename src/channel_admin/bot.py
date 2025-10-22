@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 
 from .config import FilterConfig, PricingConfig
 from .services import ChannelEconomyService
-from .storage import InMemoryStorage
+from .storage import AbstractStorage, InMemoryStorage, JsonStorage
 from .payments import CryptoPayClient, CryptoPayError
 from .models import Invoice, utcnow
 
@@ -73,6 +73,7 @@ TELEGRAM_CHANNEL_ID: int | None = _parse_int_env("TELEGRAM_CHANNEL_ID")
 TELEGRAM_CHAT_ID: int | None = _parse_int_env("TELEGRAM_CHAT_ID")
 AUTOPOST_INTERVAL_SECONDS: int = max(int(os.environ.get("AUTOPOST_INTERVAL_SECONDS", "60")), 10)
 PAID_INVOICE_STATUSES: set[str] = {"paid", "completed"}
+JSON_STORAGE_PATH: str | None = os.environ.get("JSON_STORAGE_PATH")
 
 
 def build_service() -> ChannelEconomyService:
@@ -84,8 +85,19 @@ def build_service() -> ChannelEconomyService:
         else:
             pricing.rubles_per_usd = rate
     filter_config = FilterConfig()
-    storage = InMemoryStorage()
+    storage = build_storage()
     return ChannelEconomyService(storage=storage, pricing=pricing, filter_config=filter_config)
+
+
+def build_storage() -> AbstractStorage:
+    if JSON_STORAGE_PATH:
+        try:
+            return JsonStorage(JSON_STORAGE_PATH)
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.error(
+                "Failed to initialise JSON storage at %s: %s", JSON_STORAGE_PATH, exc
+            )
+    return InMemoryStorage()
 
 
 def build_crypto_client() -> CryptoPayClient | None:
