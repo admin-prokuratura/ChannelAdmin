@@ -16,12 +16,15 @@ class CryptoPayError(RuntimeError):
 
 @dataclass(slots=True)
 class CryptoPayInvoice:
-    """Represents a created Crypto Pay invoice."""
+    """Represents a Crypto Pay invoice."""
 
     invoice_id: int
     pay_url: str
     amount: float
     asset: str
+    status: str
+    description: str | None = None
+    payload: str | None = None
 
 
 @dataclass(slots=True)
@@ -73,4 +76,40 @@ class CryptoPayClient:
             pay_url=str(result["pay_url"]),
             amount=float(result["amount"]),
             asset=str(result["asset"]),
+            status=str(result["status"]),
+            description=result.get("description"),
+            payload=result.get("payload"),
+        )
+
+    async def get_invoice(self, invoice_id: int) -> CryptoPayInvoice:
+        """Retrieve a single invoice by id."""
+
+        headers = {"Crypto-Pay-API-Token": self.token}
+        request_body = {"invoice_ids": [invoice_id]}
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.api_base}/getInvoices",
+                headers=headers,
+                json=request_body,
+            ) as response:
+                response.raise_for_status()
+                payload_json = await response.json()
+
+        if not payload_json.get("ok", False):
+            raise CryptoPayError(payload_json.get("error", "Crypto Pay request failed"))
+
+        results = payload_json.get("result") or []
+        if not results:
+            raise CryptoPayError(f"Invoice {invoice_id} not found")
+
+        result = results[0]
+        return CryptoPayInvoice(
+            invoice_id=int(result["invoice_id"]),
+            pay_url=str(result["pay_url"]),
+            amount=float(result["amount"]),
+            asset=str(result["asset"]),
+            status=str(result["status"]),
+            description=result.get("description"),
+            payload=result.get("payload"),
         )

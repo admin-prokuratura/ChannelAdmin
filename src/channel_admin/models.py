@@ -17,6 +17,8 @@ class User:
     energy: int = 0
     golden_cards: list["GoldenCard"] = field(default_factory=list)
     referred_users: set[int] = field(default_factory=set)
+    is_banned: bool = False
+    is_admin: bool = False
 
     def add_energy(self, amount: int) -> None:
         if amount < 0:
@@ -47,6 +49,14 @@ class Post:
     text: str
     requires_pin: bool = False
     created_at: datetime = field(default_factory=utcnow)
+    post_id: int | None = None
+    status: str = "pending"
+    channel_message_id: Optional[int] = None
+    chat_message_id: Optional[int] = None
+    button_text: Optional[str] = None
+    button_url: Optional[str] = None
+    photo_file_id: Optional[str] = None
+    parse_mode: Optional[str] = None
 
 
 @dataclass(slots=True)
@@ -57,3 +67,27 @@ class GoldenCard:
     @property
     def expires_at(self) -> datetime:
         return self.purchased_at + self.duration
+
+
+@dataclass(slots=True)
+class Invoice:
+    invoice_id: int
+    user_id: int
+    invoice_type: str
+    amount: float
+    asset: str
+    pay_url: str
+    price: float
+    status: str = "pending"
+    created_at: datetime = field(default_factory=utcnow)
+    paid_at: Optional[datetime] = None
+    payload: Optional[str] = None
+    energy_amount: Optional[int] = None
+    golden_hours: Optional[int] = None
+
+
+@dataclass(slots=True)
+class BotSettings:
+    autopost_paused: bool = False
+    post_energy_cost: int = 20
+    energy_price_per_unit: float = 1.0

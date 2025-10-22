@@ -1,0 +1,16 @@
+README.md
+pyproject.toml
+src/channel_admin/__init__.py
+src/channel_admin/bot.py
+src/channel_admin/config.py
+src/channel_admin/filtering.py
+src/channel_admin/models.py
+src/channel_admin/payments.py
+src/channel_admin/services.py
+src/channel_admin/storage.py
+src/channel_admin.egg-info/PKG-INFO
+src/channel_admin.egg-info/SOURCES.txt
+src/channel_admin.egg-info/dependency_links.txt
+src/channel_admin.egg-info/requires.txt
+src/channel_admin.egg-info/top_level.txt
+tests/test_services.py
