@@ -41,6 +41,18 @@ def _parse_int_env(name: str) -> int | None:
         return None
 
 
+def _parse_float_env(name: str) -> float | None:
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    try:
+        normalized = raw.replace(",", ".")
+        return float(normalized)
+    except ValueError:
+        LOGGER.warning("Environment variable %s must be a number (got %r)", name, raw)
+        return None
+
+
 def _parse_admin_ids(raw: str | None) -> set[int]:
     if not raw:
         return set()
@@ -65,6 +77,12 @@ PAID_INVOICE_STATUSES: set[str] = {"paid", "completed"}
 
 def build_service() -> ChannelEconomyService:
     pricing = PricingConfig()
+    rate = _parse_float_env("RUB_PER_USD")
+    if rate is not None:
+        if rate <= 0:
+            LOGGER.warning("RUB_PER_USD must be positive, got %s", rate)
+        else:
+            pricing.rubles_per_usd = rate
     filter_config = FilterConfig()
     storage = InMemoryStorage()
     return ChannelEconomyService(storage=storage, pricing=pricing, filter_config=filter_config)
@@ -76,6 +94,27 @@ def build_crypto_client() -> CryptoPayClient | None:
         LOGGER.warning("CRYPTOPAY_TOKEN is not configured; payments will be disabled")
         return None
     return CryptoPayClient(token=token)
+
+
+def _clean_full_name(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = " ".join(value.split())
+    return cleaned or None
+
+
+def sync_user_profile(update: Update, service: ChannelEconomyService) -> None:
+    tg_user = update.effective_user
+    if tg_user is None:
+        return
+    if service.get_user_balance(tg_user.id) is None:
+        return
+    full_name = _clean_full_name(tg_user.full_name)
+    service.update_user_profile(
+        tg_user.id,
+        username=tg_user.username,
+        full_name=full_name,
+    )
 
 
 def ensure_dependencies(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -177,14 +216,26 @@ def get_crypto_client(context: ContextTypes.DEFAULT_TYPE) -> CryptoPayClient | N
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     service = get_service(context)
+    tg_user = update.effective_user
+    if tg_user is None:
+        if update.message:
+            await update.message.reply_text("Не удалось определить пользователя.")
+        return
+    full_name = _clean_full_name(tg_user.full_name)
     try:
-        service.register_user(update.effective_user.id, subscribed_to_sponsors=True)
+        service.register_user(
+            tg_user.id,
+            subscribed_to_sponsors=True,
+            username=tg_user.username,
+            full_name=full_name,
+        )
     except ValueError as exc:
         await update.message.reply_text(str(exc))
         return
+    sync_user_profile(update, service)
     ensure_dependencies(context)
-    user = service.get_user_balance(update.effective_user.id)
-    if user and user.is_banned and not is_admin_id(update.effective_user.id, context):
+    user = service.get_user_balance(tg_user.id)
+    if user and user.is_banned and not is_admin_id(tg_user.id, context):
         await update.message.reply_text("Ваш доступ к боту ограничен.")
         return
     await update.message.reply_text(
@@ -210,6 +261,7 @@ async def handle_menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     service = get_service(context)
+    sync_user_profile(update, service)
     user_id = update.effective_user.id if update.effective_user else None
     if user_id is None:
         await query.answer("Не удалось определить пользователя", show_alert=True)
@@ -364,6 +416,7 @@ async def buy_golden_card(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     service = get_service(context)
+    sync_user_profile(update, service)
     if not context.args:
         await update.message.reply_text("Укажите текст поста после команды /post")
         return
@@ -406,6 +459,7 @@ async def handle_energy_selection(update: Update, context: ContextTypes.DEFAULT_
         return
 
     service = get_service(context)
+    sync_user_profile(update, service)
     user_id = update.effective_user.id if update.effective_user else None
     if user_id is None:
         await query.message.reply_text("Не удалось определить пользователя. Попробуйте позже.")
@@ -419,6 +473,9 @@ async def handle_energy_selection(update: Update, context: ContextTypes.DEFAULT_
         return
 
     price = service.pricing.price_for_energy(amount)
+    rub_total = None
+    if service.current_settings:
+        rub_total = service.current_settings.energy_price_per_unit * amount
     client = get_crypto_client(context)
     if client is None:
         await query.message.reply_text(
@@ -463,9 +520,13 @@ async def handle_energy_selection(update: Update, context: ContextTypes.DEFAULT_
         ]
     )
 
+    amount_line = f"Сумма к оплате: {price:.2f} $"
+    if rub_total is not None:
+        amount_line += f" (~{rub_total:.2f} ₽)"
+
     await query.message.reply_text(
         "💳 Счёт для пополнения готов!\n"
-        f"Сумма к оплате: {price:.2f} $\n"
+        f"{amount_line}\n"
         "После оплаты нажмите «Проверить оплату», чтобы получить энергию.",
         reply_markup=keyboard,
     )
@@ -497,6 +558,11 @@ async def handle_golden_selection(update: Update, context: ContextTypes.DEFAULT_
 
     duration = timedelta(hours=hours)
     price = service.pricing.price_for_golden_card(duration)
+    rub_total = None
+    try:
+        rub_total = service.pricing.convert_usd_to_rub(price)
+    except ValueError:
+        rub_total = None
     client = get_crypto_client(context)
     if client is None:
         await query.message.reply_text(
@@ -541,9 +607,13 @@ async def handle_golden_selection(update: Update, context: ContextTypes.DEFAULT_
         ]
     )
 
+    price_line = f"Стоимость: {price:.2f} $"
+    if rub_total is not None:
+        price_line += f" (~{rub_total:.2f} ₽)"
+
     await query.message.reply_text(
         "🌟 Счёт на золотую карточку готов!\n"
-        f"Стоимость: {price:.2f} $\n"
+        f"{price_line}\n"
         "После оплаты нажмите «Проверить оплату», чтобы активировать карточку.",
         reply_markup=keyboard,
     )
@@ -562,6 +632,7 @@ async def handle_invoice_check(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     service = get_service(context)
+    sync_user_profile(update, service)
     stored_invoice = service.get_invoice(invoice_id)
     user_id = update.effective_user.id if update.effective_user else None
 
@@ -701,7 +772,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await message.reply_text(str(exc))
             return
         await message.reply_text(
-            f"Цена за энергию обновлена: {settings.energy_price_per_unit:.2f} $ за 1 ⚡️."
+            f"Цена за энергию обновлена: {settings.energy_price_per_unit:.2f} ₽ за 1 ⚡️."
         )
         await show_admin_menu(update, context, info="Цена за энергию обновлена.")
         return
@@ -776,6 +847,9 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await message.reply_text("🚫 Ваш доступ к боту ограничен.")
             return
         price = service.pricing.price_for_energy(amount)
+        rub_total = None
+        if service.current_settings:
+            rub_total = service.current_settings.energy_price_per_unit * amount
         client = get_crypto_client(context)
         if client is None:
             user_data.pop("awaiting_custom_energy", None)
@@ -820,9 +894,13 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             ]
         )
 
+        amount_line = f"Сумма к оплате: {price:.2f} $"
+        if rub_total is not None:
+            amount_line += f" (~{rub_total:.2f} ₽)"
+
         await message.reply_text(
             "💳 Счёт для пополнения готов!\n"
-            f"Сумма к оплате: {price:.2f} $\n"
+            f"{amount_line}\n"
             "После оплаты нажмите «Проверить оплату», чтобы получить энергию.",
             reply_markup=keyboard,
         )
@@ -1076,7 +1154,10 @@ async def show_users_page(
         if user.is_banned:
             tags.append("ban")
         tag_str = f" [{' • '.join(tags)}]" if tags else ""
+        username_display = f"@{user.username}" if user.username else "—"
+        name_display = user.full_name or "—"
         lines.append(f"• {user.user_id} — {user.energy}⚡️{tag_str}")
+        lines.append(f"  {username_display} • {name_display}")
     lines.append(f"\nСтраница {page + 1} из {max_page + 1}")
 
     buttons = [
@@ -1134,8 +1215,12 @@ async def show_user_detail(
     pending_posts = service.list_posts_for_user(user.user_id, ["pending"])
     approved_posts = service.list_posts_for_user(user.user_id, ["approved", "publishing"])
 
+    username_display = f"@{user.username}" if user.username else "—"
+    name_display = user.full_name or "—"
     lines = [
         f"👤 Пользователь {user.user_id}",
+        f"• Username: {username_display}",
+        f"• Имя: {name_display}",
         f"• ⚡️ Баланс: {user.energy}",
         f"• 🌟 Золотых карточек: {len(user.golden_cards)}",
         f"• Статус: {'🚫 Забанен' if user.is_banned else '✅ Активен'}",
@@ -1438,7 +1523,7 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         info = (
             "⚙️ Настройки цен\n"
             f"• Стоимость публикации: {settings.post_energy_cost} ⚡️\n"
-            f"• Цена 1 ⚡️: {settings.energy_price_per_unit:.2f} $\n\n"
+            f"• Цена 1 ⚡️: {settings.energy_price_per_unit:.2f} ₽\n\n"
             "Выберите параметр для изменения."
         )
         keyboard = InlineKeyboardMarkup(
