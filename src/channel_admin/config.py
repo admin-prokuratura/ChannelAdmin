@@ -14,13 +14,13 @@ class PricingConfig:
     energy_price_per_unit: float = 1.0
     energy_bundle_prices: Dict[int, float] = field(
         default_factory=lambda: {
-            50: 3.00,
-            100: 6.00,
-            300: 20.0,
+            50: 249.00,
+            100: 499.00,
+            300: 1499.0,
         }
     )
     golden_card_hourly_price: float = 1.5
-    rubles_per_usd: float = 100.0
+    rubles_per_usd: float = 66.4
 
     def price_for_energy(self, amount: int) -> float:
         if amount in self.energy_bundle_prices:
