@@ -20,6 +20,7 @@ class PricingConfig:
         }
     )
     golden_card_hourly_price: float = 1.5
+    rubles_per_usd: float = 100.0
 
     def price_for_energy(self, amount: int) -> float:
         if amount in self.energy_bundle_prices:
@@ -31,6 +32,20 @@ class PricingConfig:
         if total_hours <= 0:
             raise ValueError("Golden card duration must be positive")
         return self.golden_card_hourly_price * total_hours
+
+    def convert_rub_to_usd(self, rub_amount: float) -> float:
+        if rub_amount <= 0:
+            return 0.0
+        if self.rubles_per_usd <= 0:
+            raise ValueError("Exchange rate must be positive")
+        return rub_amount / self.rubles_per_usd
+
+    def convert_usd_to_rub(self, usd_amount: float) -> float:
+        if usd_amount <= 0:
+            return 0.0
+        if self.rubles_per_usd <= 0:
+            raise ValueError("Exchange rate must be positive")
+        return usd_amount * self.rubles_per_usd
 
 
 @dataclass(slots=True)

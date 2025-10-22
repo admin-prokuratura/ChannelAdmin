@@ -19,6 +19,8 @@ class User:
     referred_users: set[int] = field(default_factory=set)
     is_banned: bool = False
     is_admin: bool = False
+    username: str | None = None
+    full_name: str | None = None
 
     def add_energy(self, amount: int) -> None:
         if amount < 0:

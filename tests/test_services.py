@@ -9,19 +9,42 @@ from channel_admin.storage import InMemoryStorage
 
 @pytest.fixture()
 def service() -> ChannelEconomyService:
-    return ChannelEconomyService(
+    pricing = PricingConfig(rubles_per_usd=1.0)
+    service = ChannelEconomyService(
         storage=InMemoryStorage(),
-        pricing=PricingConfig(),
+        pricing=pricing,
         filter_config=FilterConfig(banned_words={"запрещено"}),
         registration_energy=100,
         referral_energy=30,
         post_energy_cost=10,
     )
+    service.update_post_price(10)
+    return service
 
 
 def test_registration_awards_energy(service: ChannelEconomyService) -> None:
     user = service.register_user(1, subscribed_to_sponsors=True)
     assert user.energy == 100
+
+
+def test_registration_stores_profile(service: ChannelEconomyService) -> None:
+    user = service.register_user(
+        1,
+        subscribed_to_sponsors=True,
+        username="alice",
+        full_name="Alice Example",
+    )
+    assert user.username == "alice"
+    assert user.full_name == "Alice Example"
+
+    updated = service.register_user(
+        1,
+        subscribed_to_sponsors=True,
+        username="alice_new",
+        full_name="Alice Updated",
+    )
+    assert updated.username == "alice_new"
+    assert updated.full_name == "Alice Updated"
 
 
 def test_registration_requires_subscription(service: ChannelEconomyService) -> None:

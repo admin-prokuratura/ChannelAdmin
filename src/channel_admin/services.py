@@ -37,29 +37,72 @@ class ChannelEconomyService:
 
     def apply_settings(self, settings: BotSettings) -> None:
         self.post_energy_cost = settings.post_energy_cost
-        self.pricing.energy_price_per_unit = settings.energy_price_per_unit
+        usd_per_unit = self.pricing.convert_rub_to_usd(settings.energy_price_per_unit)
+        self.pricing.energy_price_per_unit = usd_per_unit
         for amount in list(self.pricing.energy_bundle_prices.keys()):
-            self.pricing.energy_bundle_prices[amount] = round(
-                settings.energy_price_per_unit * amount, 2
-            )
+            self.pricing.energy_bundle_prices[amount] = round(usd_per_unit * amount, 2)
         self.current_settings = settings
 
-    def register_user(self, user_id: int, subscribed_to_sponsors: bool) -> User:
+    def register_user(
+        self,
+        user_id: int,
+        subscribed_to_sponsors: bool,
+        *,
+        username: str | None = None,
+        full_name: str | None = None,
+    ) -> User:
         if not subscribed_to_sponsors:
             raise ValueError("User must subscribe to sponsors before registering")
         user = self.storage.get_user(user_id)
         if user is None:
-            user = User(user_id=user_id)
+            user = User(user_id=user_id, username=username, full_name=full_name)
             user.add_energy(self.registration_energy)
+            self.storage.save_user(user)
+            return user
+        updated = False
+        if username is not None and username != user.username:
+            user.username = username
+            updated = True
+        if full_name is not None and full_name != user.full_name:
+            user.full_name = full_name
+            updated = True
+        if updated:
             self.storage.save_user(user)
         return user
 
-    def _get_or_create_user(self, user_id: int) -> User:
+    def _get_or_create_user(
+        self,
+        user_id: int,
+        *,
+        username: str | None = None,
+        full_name: str | None = None,
+    ) -> User:
         user = self.storage.get_user(user_id)
         if user is None:
-            user = User(user_id=user_id)
+            user = User(user_id=user_id, username=username, full_name=full_name)
+            self.storage.save_user(user)
+            return user
+        updated = False
+        if username is not None and username != user.username:
+            user.username = username
+            updated = True
+        if full_name is not None and full_name != user.full_name:
+            user.full_name = full_name
+            updated = True
+        if updated:
             self.storage.save_user(user)
         return user
+
+    def update_user_profile(
+        self,
+        user_id: int,
+        *,
+        username: str | None = None,
+        full_name: str | None = None,
+    ) -> User:
+        return self._get_or_create_user(
+            user_id, username=username, full_name=full_name
+        )
 
     def purchase_energy(self, user_id: int, amount: int) -> float:
         user = self._get_or_create_user(user_id)
