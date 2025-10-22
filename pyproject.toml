@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "channel-admin"
+version = "0.1.0"
+description = "Telegram channel administration bot domain logic"
+authors = [{ name = "Channel Admin" }]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "python-telegram-bot>=21.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+]
+
+[tool.setuptools]
+packages = ["channel_admin"]
+package-dir = {"" = "src"}
+include-package-data = true
