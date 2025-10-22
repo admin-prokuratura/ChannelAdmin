@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 from datetime import timedelta
@@ -339,7 +338,7 @@ async def handle_post_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
-async def main() -> None:
+def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is required")
@@ -367,16 +366,9 @@ async def main() -> None:
     application.add_handler(CommandHandler("post", post))
 
     LOGGER.info("Bot started")
-    await application.initialize()
-    await application.start()
-    try:
-        await application.updater.start_polling()
-        await application.updater.wait_until_closed()
-    finally:
-        await application.stop()
-        await application.shutdown()
+    application.run_polling()
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(main())
+    main()
