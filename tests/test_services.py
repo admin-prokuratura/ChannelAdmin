@@ -97,3 +97,26 @@ def test_award_referral_only_once(service: ChannelEconomyService) -> None:
     service.award_referral(1, 2)
     user = service.get_user_balance(1)
     assert user and user.energy == service.referral_energy
+
+
+def test_support_ticket_flow(service: ChannelEconomyService) -> None:
+    service.register_user(1, subscribed_to_sponsors=True)
+    ticket = service.open_ticket(1, "Нужна помощь")
+    assert ticket.ticket_id > 0
+    assert ticket.status == "open"
+    assert len(ticket.messages) == 1
+
+    updated = service.add_ticket_message(ticket.ticket_id, "admin", "Добрый день")
+    assert len(updated.messages) == 2
+
+    service.close_ticket(ticket.ticket_id)
+    closed = service.get_ticket(ticket.ticket_id)
+    assert closed is not None
+    assert closed.status == "closed"
+
+    reopened = service.reopen_ticket(ticket.ticket_id)
+    assert reopened.status == "open"
+
+    user_tickets = service.list_user_tickets(1)
+    assert len(user_tickets) == 1
+    assert user_tickets[0].ticket_id == ticket.ticket_id

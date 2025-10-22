@@ -10,7 +10,7 @@ from typing import Dict, Iterable, Optional, Sequence
 
 from .config import FilterConfig, PricingConfig
 from .filtering import WordFilter
-from .models import BotSettings, GoldenCard, Invoice, Post, User, utcnow
+from .models import BotSettings, GoldenCard, Invoice, Post, Ticket, User, utcnow
 from .storage import AbstractStorage
 
 DEFAULT_REGISTRATION_ENERGY = 100
@@ -230,6 +230,63 @@ class ChannelEconomyService:
 
     def list_invoices_for_user(self, user_id: int) -> list[Invoice]:
         return list(self.storage.list_invoices_for_user(user_id))
+
+    def open_ticket(self, user_id: int, message: str) -> Ticket:
+        text = (message or "").strip()
+        if not text:
+            raise ValueError("Сообщение не должно быть пустым")
+        user = self._get_or_create_user(user_id)
+        if user.is_banned:
+            raise ValueError("Пользователь заблокирован")
+        return self.storage.create_ticket(user_id, text)
+
+    def add_ticket_message(
+        self, ticket_id: int, sender: str, message: str
+    ) -> Ticket:
+        text = (message or "").strip()
+        if not text:
+            raise ValueError("Сообщение не должно быть пустым")
+        if sender not in {"user", "admin"}:
+            raise ValueError("Недопустимый отправитель")
+        ticket = self.storage.add_ticket_message(ticket_id, sender, text)
+        if ticket is None:
+            raise ValueError("Тикет не найден")
+        return ticket
+
+    def get_ticket(self, ticket_id: int) -> Ticket | None:
+        return self.storage.get_ticket(ticket_id)
+
+    def list_user_tickets(self, user_id: int) -> list[Ticket]:
+        return list(self.storage.list_tickets_for_user(user_id))
+
+    def list_tickets(self, status: str | None = None) -> list[Ticket]:
+        return list(self.storage.list_tickets(status=status))
+
+    def close_ticket(
+        self, ticket_id: int, *, actor_user_id: int | None = None
+    ) -> Ticket:
+        ticket = self.storage.get_ticket(ticket_id)
+        if ticket is None:
+            raise ValueError("Тикет не найден")
+        if actor_user_id is not None and ticket.user_id != actor_user_id:
+            raise PermissionError("Недостаточно прав для изменения тикета")
+        ticket.status = "closed"
+        ticket.updated_at = utcnow()
+        self.storage.save_ticket(ticket)
+        return ticket
+
+    def reopen_ticket(
+        self, ticket_id: int, *, actor_user_id: int | None = None
+    ) -> Ticket:
+        ticket = self.storage.get_ticket(ticket_id)
+        if ticket is None:
+            raise ValueError("Тикет не найден")
+        if actor_user_id is not None and ticket.user_id != actor_user_id:
+            raise PermissionError("Недостаточно прав для изменения тикета")
+        ticket.status = "open"
+        ticket.updated_at = utcnow()
+        self.storage.save_ticket(ticket)
+        return ticket
 
     def set_autopost_paused(self, paused: bool) -> None:
         settings = self.storage.get_settings()
