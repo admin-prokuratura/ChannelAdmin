@@ -10,7 +10,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
-from .models import BotSettings, GoldenCard, Invoice, Post, User, utcnow
+from .models import (
+    BotSettings,
+    GoldenCard,
+    Invoice,
+    Post,
+    Ticket,
+    TicketMessage,
+    User,
+    utcnow,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -206,6 +215,65 @@ def _deserialize_invoice(payload: dict) -> Invoice:
     )
 
 
+def _serialize_ticket_message(message: TicketMessage) -> dict:
+    return {
+        "message_id": message.message_id,
+        "ticket_id": message.ticket_id,
+        "sender": message.sender,
+        "text": message.text,
+        "created_at": _datetime_to_iso(message.created_at),
+    }
+
+
+def _deserialize_ticket_message(payload: dict) -> TicketMessage:
+    return TicketMessage(
+        message_id=_safe_int(payload.get("message_id", 0)),
+        ticket_id=_safe_int(payload.get("ticket_id", 0)),
+        sender=str(payload.get("sender") or "user"),
+        text=str(payload.get("text") or ""),
+        created_at=_iso_to_datetime(payload.get("created_at"))
+        or datetime.fromtimestamp(0, tz=timezone.utc),
+    )
+
+
+def _serialize_ticket(ticket: Ticket) -> dict:
+    return {
+        "ticket_id": ticket.ticket_id,
+        "user_id": ticket.user_id,
+        "status": ticket.status,
+        "subject": ticket.subject,
+        "created_at": _datetime_to_iso(ticket.created_at),
+        "updated_at": _datetime_to_iso(ticket.updated_at),
+        "messages": [
+            _serialize_ticket_message(message) for message in ticket.messages
+        ],
+    }
+
+
+def _deserialize_ticket(payload: dict) -> Ticket:
+    ticket = Ticket(
+        ticket_id=_safe_int(payload.get("ticket_id", 0)),
+        user_id=_safe_int(payload.get("user_id", 0)),
+        status=str(payload.get("status") or "open"),
+        subject=payload.get("subject"),
+        created_at=_iso_to_datetime(payload.get("created_at"))
+        or datetime.fromtimestamp(0, tz=timezone.utc),
+        updated_at=_iso_to_datetime(payload.get("updated_at"))
+        or datetime.fromtimestamp(0, tz=timezone.utc),
+    )
+    messages: list[TicketMessage] = []
+    for raw in payload.get("messages", []):
+        try:
+            message = _deserialize_ticket_message(raw)
+        except Exception:  # pragma: no cover - defensive
+            LOGGER.warning("Skipping malformed ticket message payload: %r", raw)
+            continue
+        messages.append(message)
+    for message in sorted(messages, key=lambda msg: msg.created_at):
+        ticket.add_message(message)
+    return ticket
+
+
 def _serialize_settings(settings: BotSettings) -> dict:
     return {
         "autopost_paused": settings.autopost_paused,
@@ -286,6 +354,26 @@ class AbstractStorage:
     def count_posts(self, status: Optional[str] = None) -> int:
         raise NotImplementedError
 
+    def create_ticket(self, user_id: int, initial_message: str) -> Ticket:
+        raise NotImplementedError
+
+    def get_ticket(self, ticket_id: int) -> Optional[Ticket]:
+        raise NotImplementedError
+
+    def save_ticket(self, ticket: Ticket) -> None:
+        raise NotImplementedError
+
+    def list_tickets(self, status: Optional[str] = None) -> Iterable[Ticket]:
+        raise NotImplementedError
+
+    def list_tickets_for_user(self, user_id: int) -> Iterable[Ticket]:
+        raise NotImplementedError
+
+    def add_ticket_message(
+        self, ticket_id: int, sender: str, text: str
+    ) -> Optional[Ticket]:
+        raise NotImplementedError
+
 
 class InMemoryStorage(AbstractStorage):
     """Simple dictionary-based storage for demos and tests."""
@@ -296,6 +384,9 @@ class InMemoryStorage(AbstractStorage):
         self._post_sequence: int = 1
         self._invoices: Dict[int, Invoice] = {}
         self._settings: BotSettings = BotSettings()
+        self._tickets: Dict[int, Ticket] = {}
+        self._ticket_sequence: int = 1
+        self._ticket_message_sequence: int = 1
 
     def get_user(self, user_id: int) -> Optional[User]:
         user = self._users.get(user_id)
@@ -378,6 +469,69 @@ class InMemoryStorage(AbstractStorage):
             return len(self._posts)
         return sum(1 for post in self._posts.values() if post.status == status)
 
+    def create_ticket(self, user_id: int, initial_message: str) -> Ticket:
+        ticket_id = self._ticket_sequence
+        self._ticket_sequence += 1
+        ticket = Ticket(ticket_id=ticket_id, user_id=user_id)
+        message = TicketMessage(
+            message_id=self._ticket_message_sequence,
+            ticket_id=ticket_id,
+            sender="user",
+            text=initial_message,
+        )
+        self._ticket_message_sequence += 1
+        ticket.add_message(message)
+        if ticket.subject is None:
+            preview = initial_message.strip()
+            ticket.subject = preview[:80] if preview else None
+        self._tickets[ticket_id] = deepcopy(ticket)
+        return deepcopy(ticket)
+
+    def get_ticket(self, ticket_id: int) -> Optional[Ticket]:
+        ticket = self._tickets.get(ticket_id)
+        if ticket is None:
+            return None
+        return deepcopy(ticket)
+
+    def save_ticket(self, ticket: Ticket) -> None:
+        self._tickets[ticket.ticket_id] = deepcopy(ticket)
+
+    def list_tickets(self, status: Optional[str] = None) -> Iterable[Ticket]:
+        tickets = list(self._tickets.values())
+        if status is not None:
+            tickets = [ticket for ticket in tickets if ticket.status == status]
+        tickets.sort(key=lambda t: t.updated_at, reverse=True)
+        return [deepcopy(ticket) for ticket in tickets]
+
+    def list_tickets_for_user(self, user_id: int) -> Iterable[Ticket]:
+        tickets = [
+            ticket
+            for ticket in self._tickets.values()
+            if ticket.user_id == user_id
+        ]
+        tickets.sort(key=lambda t: t.updated_at, reverse=True)
+        return [deepcopy(ticket) for ticket in tickets]
+
+    def add_ticket_message(
+        self, ticket_id: int, sender: str, text: str
+    ) -> Optional[Ticket]:
+        ticket = self._tickets.get(ticket_id)
+        if ticket is None:
+            return None
+        message = TicketMessage(
+            message_id=self._ticket_message_sequence,
+            ticket_id=ticket_id,
+            sender=sender,
+            text=text,
+        )
+        self._ticket_message_sequence += 1
+        ticket.add_message(message)
+        if sender == "user" and not ticket.subject:
+            preview = text.strip()
+            ticket.subject = preview[:80] if preview else None
+        self._tickets[ticket_id] = deepcopy(ticket)
+        return deepcopy(ticket)
+
 
 class JsonStorage(InMemoryStorage):
     """JSON-backed storage persisted on disk."""
@@ -399,7 +553,13 @@ class JsonStorage(InMemoryStorage):
                 str(invoice_id): _serialize_invoice(invoice)
                 for invoice_id, invoice in self._invoices.items()
             },
+            "tickets": {
+                str(ticket_id): _serialize_ticket(ticket)
+                for ticket_id, ticket in self._tickets.items()
+            },
             "settings": _serialize_settings(self._settings),
+            "ticket_sequence": self._ticket_sequence,
+            "ticket_message_sequence": self._ticket_message_sequence,
         }
         temp_path = self._path.with_suffix(self._path.suffix + ".tmp")
         try:
@@ -445,6 +605,14 @@ class JsonStorage(InMemoryStorage):
                 for invoice_id, invoice_payload in raw_invoices.items()
             }
 
+            raw_tickets = payload.get("tickets", {}) or {}
+            self._tickets = {
+                int(ticket_id): _deserialize_ticket(
+                    {"ticket_id": ticket_id, **ticket_payload}
+                )
+                for ticket_id, ticket_payload in raw_tickets.items()
+            }
+
             stored_sequence = payload.get("post_sequence")
             if isinstance(stored_sequence, int) and stored_sequence > 0:
                 self._post_sequence = stored_sequence
@@ -453,6 +621,28 @@ class JsonStorage(InMemoryStorage):
                     max(self._posts.keys(), default=0) + 1
                     if self._posts
                     else 1
+                )
+
+            ticket_sequence = payload.get("ticket_sequence")
+            if isinstance(ticket_sequence, int) and ticket_sequence > 0:
+                self._ticket_sequence = ticket_sequence
+            else:
+                self._ticket_sequence = (
+                    max(self._tickets.keys(), default=0) + 1
+                    if self._tickets
+                    else 1
+                )
+
+            message_sequence = payload.get("ticket_message_sequence")
+            if isinstance(message_sequence, int) and message_sequence > 0:
+                self._ticket_message_sequence = message_sequence
+            else:
+                self._ticket_message_sequence = (
+                    max(
+                        (message.message_id for ticket in self._tickets.values() for message in ticket.messages),
+                        default=0,
+                    )
+                    + 1
                 )
 
             self._settings = _deserialize_settings(payload.get("settings"))
@@ -482,3 +672,20 @@ class JsonStorage(InMemoryStorage):
     def save_settings(self, settings: BotSettings) -> None:
         super().save_settings(settings)
         self._persist()
+
+    def create_ticket(self, user_id: int, initial_message: str) -> Ticket:
+        ticket = super().create_ticket(user_id, initial_message)
+        self._persist()
+        return ticket
+
+    def save_ticket(self, ticket: Ticket) -> None:
+        super().save_ticket(ticket)
+        self._persist()
+
+    def add_ticket_message(
+        self, ticket_id: int, sender: str, text: str
+    ) -> Optional[Ticket]:
+        ticket = super().add_ticket_message(ticket_id, sender, text)
+        if ticket is not None:
+            self._persist()
+        return ticket

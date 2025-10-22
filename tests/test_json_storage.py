@@ -40,6 +40,11 @@ def test_json_storage_persists_between_sessions(tmp_path) -> None:
     settings = BotSettings(autopost_paused=True, post_energy_cost=40, energy_price_per_unit=1.5)
     storage.save_settings(settings)
 
+    ticket = storage.create_ticket(1, "Помогите")
+    ticket = storage.add_ticket_message(ticket.ticket_id, "admin", "Уточните детали") or ticket
+    ticket.status = "closed"
+    storage.save_ticket(ticket)
+
     assert db_path.exists()
 
     fresh_storage = JsonStorage(db_path)
@@ -65,6 +70,11 @@ def test_json_storage_persists_between_sessions(tmp_path) -> None:
     assert loaded_settings.autopost_paused is True
     assert loaded_settings.post_energy_cost == 40
     assert loaded_settings.energy_price_per_unit == 1.5
+
+    loaded_ticket = fresh_storage.get_ticket(ticket.ticket_id)
+    assert loaded_ticket is not None
+    assert loaded_ticket.status == "closed"
+    assert len(loaded_ticket.messages) == 2
 
     new_post = Post(user_id=1, text="Another")
     fresh_storage.add_post(new_post)

@@ -3,7 +3,8 @@
 from __future__ import annotations
 import logging
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta
+from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -22,7 +23,7 @@ from .config import FilterConfig, PricingConfig
 from .services import ChannelEconomyService
 from .storage import AbstractStorage, InMemoryStorage, JsonStorage
 from .payments import CryptoPayClient, CryptoPayError
-from .models import Invoice, utcnow
+from .models import Invoice, Ticket, utcnow
 
 LOGGER = logging.getLogger(__name__)
 
@@ -74,6 +75,9 @@ TELEGRAM_CHAT_ID: int | None = _parse_int_env("TELEGRAM_CHAT_ID")
 AUTOPOST_INTERVAL_SECONDS: int = max(int(os.environ.get("AUTOPOST_INTERVAL_SECONDS", "60")), 10)
 PAID_INVOICE_STATUSES: set[str] = {"paid", "completed"}
 JSON_STORAGE_PATH: str | None = os.environ.get("JSON_STORAGE_PATH")
+DEFAULT_JSON_STORAGE_PATH = (
+    Path(__file__).resolve().parent.parent / "data" / "storage.json"
+)
 
 
 def build_service() -> ChannelEconomyService:
@@ -90,13 +94,13 @@ def build_service() -> ChannelEconomyService:
 
 
 def build_storage() -> AbstractStorage:
-    if JSON_STORAGE_PATH:
-        try:
-            return JsonStorage(JSON_STORAGE_PATH)
-        except Exception as exc:  # pragma: no cover - defensive
-            LOGGER.error(
-                "Failed to initialise JSON storage at %s: %s", JSON_STORAGE_PATH, exc
-            )
+    storage_path = Path(JSON_STORAGE_PATH) if JSON_STORAGE_PATH else DEFAULT_JSON_STORAGE_PATH
+    try:
+        return JsonStorage(storage_path)
+    except Exception as exc:  # pragma: no cover - defensive
+        LOGGER.error(
+            "Failed to initialise JSON storage at %s: %s", storage_path, exc
+        )
     return InMemoryStorage()
 
 
@@ -158,7 +162,7 @@ def main_menu_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("🌟 Золотая карточка", callback_data="action:golden_card"),
-            InlineKeyboardButton("💳 Проверить оплату", callback_data="action:invoices"),
+            InlineKeyboardButton("🆘 Поддержка", callback_data="action:support"),
         ],
         [
             InlineKeyboardButton("📝 Отправить пост", callback_data="action:post"),
@@ -200,6 +204,359 @@ def golden_card_keyboard() -> InlineKeyboardMarkup:
 
 ADMIN_USERS_PAGE_SIZE = 5
 POST_PREVIEW_LENGTH = 400
+SUPPORT_HISTORY_LIMIT = 10
+SUPPORT_TICKETS_PAGE_SIZE = 5
+
+
+def _format_ticket_subject(ticket: Ticket) -> str:
+    subject = ticket.subject
+    if not subject and ticket.messages:
+        subject = ticket.messages[0].text
+    if not subject:
+        subject = "Без темы"
+    normalized = " ".join(subject.split())
+    if len(normalized) > 60:
+        normalized = normalized[:57] + "..."
+    return normalized or "Без темы"
+
+
+def _format_ticket_timestamp(when: datetime) -> str:
+    try:
+        local_time = when.astimezone()
+    except ValueError:  # pragma: no cover - timezone edge case
+        local_time = when
+    return local_time.strftime("%d.%m %H:%M")
+
+
+def _format_ticket_messages(
+    ticket: Ticket, *, viewer: str, limit: int = SUPPORT_HISTORY_LIMIT
+) -> str:
+    messages = ticket.messages[-limit:]
+    if not messages:
+        return "Сообщений пока нет."
+    lines: list[str] = []
+    for message in messages:
+        timestamp = _format_ticket_timestamp(message.created_at)
+        if message.sender == "user":
+            sender_label = "👤 Вы" if viewer == "user" else "👤 Пользователь"
+        else:
+            sender_label = "🛠 Админ" if viewer == "user" else "🛠 Вы"
+        lines.append(f"[{timestamp}] {sender_label}:")
+        lines.append(message.text)
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+async def show_support_overview(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    notice: str | None = None,
+) -> None:
+    service = get_service(context)
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id is None:
+        if update.callback_query:
+            await update.callback_query.answer("Не удалось определить пользователя", show_alert=True)
+        elif update.message:
+            await update.message.reply_text("Не удалось определить пользователя.")
+        return
+
+    user = service.get_user_balance(user_id)
+    if user is None:
+        if update.callback_query:
+            await update.callback_query.answer("Сначала используйте /start", show_alert=True)
+            await update.callback_query.message.edit_text(
+                "❗️ Пользователь не найден. Нажмите /start для регистрации.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⬅️ Назад", callback_data="action:menu")]]
+                ),
+            )
+        elif update.message:
+            await update.message.reply_text("Пожалуйста, зарегистрируйтесь командой /start.")
+        return
+
+    tickets = service.list_user_tickets(user_id)
+    lines = ["🆘 Поддержка"]
+    if notice:
+        lines.append("")
+        lines.append(notice)
+
+    if tickets:
+        lines.append("")
+        lines.append("Ваши обращения:")
+        for ticket in tickets:
+            status_icon = "🟢" if ticket.status == "open" else "⚪️"
+            lines.append(f"{status_icon} #{ticket.ticket_id} — {_format_ticket_subject(ticket)}")
+    else:
+        lines.append("")
+        lines.append(
+            "У вас пока нет обращений. Нажмите «📨 Новый тикет», чтобы описать вопрос."
+        )
+
+    keyboard_rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("📨 Новый тикет", callback_data="support:new")]
+    ]
+    for ticket in tickets[:10]:
+        icon = "🔓" if ticket.status == "open" else "🔒"
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{icon} #{ticket.ticket_id}",
+                    callback_data=f"support:view:{ticket.ticket_id}",
+                )
+            ]
+        )
+    keyboard_rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="action:menu")])
+
+    keyboard = InlineKeyboardMarkup(keyboard_rows)
+    text = "\n".join(lines)
+    if update.callback_query:
+        await update.callback_query.message.edit_text(text, reply_markup=keyboard)
+    elif update.message:
+        await update.message.reply_text(text, reply_markup=keyboard)
+
+
+async def show_support_ticket_detail(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    ticket_id: int,
+    *,
+    info: str | None = None,
+) -> None:
+    service = get_service(context)
+    user_id = update.effective_user.id if update.effective_user else None
+    ticket = service.get_ticket(ticket_id)
+    if ticket is None or (user_id is not None and ticket.user_id != user_id and not is_admin_id(user_id, context)):
+        if update.callback_query:
+            await update.callback_query.answer("Тикет не найден", show_alert=True)
+        elif update.message:
+            await update.message.reply_text("Тикет не найден или доступ ограничен.")
+        return
+
+    status_text = "🟢 Открыт" if ticket.status == "open" else "✅ Закрыт"
+    lines = [
+        f"🗂 Тикет #{ticket.ticket_id}",
+        status_text,
+        f"Тема: {_format_ticket_subject(ticket)}",
+        "",
+    ]
+    if info:
+        lines.append(info)
+        lines.append("")
+    lines.append(_format_ticket_messages(ticket, viewer="user"))
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    if ticket.status == "open":
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "✍️ Ответить", callback_data=f"support:reply:{ticket.ticket_id}"
+                )
+            ]
+        )
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "✅ Закрыть", callback_data=f"support:close:{ticket.ticket_id}"
+                )
+            ]
+        )
+    else:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "♻️ Открыть снова", callback_data=f"support:reopen:{ticket.ticket_id}"
+                )
+            ]
+        )
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="support:list")])
+    keyboard = InlineKeyboardMarkup(buttons)
+
+    text = "\n".join(lines)
+    if update.callback_query:
+        await update.callback_query.message.edit_text(text, reply_markup=keyboard)
+    elif update.message:
+        await update.message.reply_text(text, reply_markup=keyboard)
+
+
+async def show_admin_support_overview(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    info: str | None = None,
+) -> None:
+    user_id = update.effective_user.id if update.effective_user else None
+    if not is_admin_id(user_id, context):
+        if update.callback_query:
+            await update.callback_query.answer("Доступ запрещён", show_alert=True)
+        elif update.message:
+            await update.message.reply_text("Доступ запрещён.")
+        return
+
+    filter_state = context.user_data.get("admin_support_filter", "open")
+    page = context.user_data.get("admin_support_page", 0)
+    service = get_service(context)
+    status_filter = None if filter_state == "all" else "open"
+    tickets = service.list_tickets(status=status_filter)
+
+    total = len(tickets)
+    if total == 0:
+        text = "🆘 Обращений не найдено."
+        if info:
+            text += f"\n\n{info}"
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Назад", callback_data="admin:refresh")]]
+        )
+        if update.callback_query:
+            await update.callback_query.message.edit_text(text, reply_markup=keyboard)
+        elif update.message:
+            await update.message.reply_text(text, reply_markup=keyboard)
+        return
+
+    tickets.sort(key=lambda t: t.updated_at, reverse=True)
+    max_page = (total - 1) // SUPPORT_TICKETS_PAGE_SIZE
+    page = max(0, min(page, max_page))
+    context.user_data["admin_support_page"] = page
+
+    start = page * SUPPORT_TICKETS_PAGE_SIZE
+    subset = tickets[start : start + SUPPORT_TICKETS_PAGE_SIZE]
+
+    lines = ["🆘 Поддержка"]
+    if info:
+        lines.append("")
+        lines.append(info)
+    lines.append("")
+    lines.append(
+        "Показываются "
+        + ("только открытые" if filter_state == "open" else "все")
+        + f" тикеты (страница {page + 1} из {max_page + 1})."
+    )
+    lines.append("")
+    for ticket in subset:
+        status_icon = "🟢" if ticket.status == "open" else "⚪️"
+        lines.append(
+            f"{status_icon} #{ticket.ticket_id} • {ticket.user_id} — {_format_ticket_subject(ticket)}"
+        )
+
+    buttons: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                "🟢 Открытые" + (" ✅" if filter_state == "open" else ""),
+                callback_data="admin:support:filter:open",
+            ),
+            InlineKeyboardButton(
+                "📁 Все" + (" ✅" if filter_state == "all" else ""),
+                callback_data="admin:support:filter:all",
+            ),
+        ]
+    ]
+
+    for ticket in subset:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"#{ticket.ticket_id} ({'🔓' if ticket.status == 'open' else '🔒'})",
+                    callback_data=f"admin:support:view:{ticket.ticket_id}",
+                )
+            ]
+        )
+
+    if max_page > 0:
+        prev_page = (page - 1) % (max_page + 1)
+        next_page = (page + 1) % (max_page + 1)
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "⬅️ Назад",
+                    callback_data=f"admin:support:page:{prev_page}",
+                ),
+                InlineKeyboardButton(
+                    "Вперёд ➡️",
+                    callback_data=f"admin:support:page:{next_page}",
+                ),
+            ]
+        )
+
+    buttons.append([InlineKeyboardButton("🎛 Админ-панель", callback_data="admin:refresh")])
+
+    text = "\n".join(lines)
+    keyboard = InlineKeyboardMarkup(buttons)
+    if update.callback_query:
+        await update.callback_query.message.edit_text(text, reply_markup=keyboard)
+    elif update.message:
+        await update.message.reply_text(text, reply_markup=keyboard)
+
+
+async def show_admin_ticket_detail(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    ticket_id: int,
+    *,
+    info: str | None = None,
+) -> None:
+    user_id = update.effective_user.id if update.effective_user else None
+    if not is_admin_id(user_id, context):
+        if update.callback_query:
+            await update.callback_query.answer("Доступ запрещён", show_alert=True)
+        elif update.message:
+            await update.message.reply_text("Доступ запрещён.")
+        return
+
+    service = get_service(context)
+    ticket = service.get_ticket(ticket_id)
+    if ticket is None:
+        if update.callback_query:
+            await update.callback_query.answer("Тикет не найден", show_alert=True)
+        elif update.message:
+            await update.message.reply_text("Тикет не найден.")
+        return
+
+    status_text = "🟢 Открыт" if ticket.status == "open" else "✅ Закрыт"
+    lines = [
+        f"🗂 Тикет #{ticket.ticket_id}",
+        status_text,
+        f"Пользователь: {ticket.user_id}",
+        f"Тема: {_format_ticket_subject(ticket)}",
+        "",
+    ]
+    if info:
+        lines.append(info)
+        lines.append("")
+    lines.append(_format_ticket_messages(ticket, viewer="admin"))
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    if ticket.status == "open":
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "✍️ Ответить", callback_data=f"admin:support:reply:{ticket.ticket_id}"
+                )
+            ]
+        )
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "✅ Закрыть", callback_data=f"admin:support:close:{ticket.ticket_id}"
+                )
+            ]
+        )
+    else:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "♻️ Открыть снова", callback_data=f"admin:support:reopen:{ticket.ticket_id}"
+                )
+            ]
+        )
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin:support")])
+
+    keyboard = InlineKeyboardMarkup(buttons)
+    text = "\n".join(lines)
+    if update.callback_query:
+        await update.callback_query.message.edit_text(text, reply_markup=keyboard)
+    elif update.message:
+        await update.message.reply_text(text, reply_markup=keyboard)
 
 
 async def send_main_menu(
@@ -269,6 +626,9 @@ async def handle_menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data.pop("awaiting_post_price", None)
         context.user_data.pop("awaiting_energy_price", None)
         context.user_data.pop("awaiting_user_balance", None)
+        context.user_data.pop("support_new_ticket", None)
+        context.user_data.pop("support_reply", None)
+        context.user_data.pop("admin_ticket_reply", None)
         await send_main_menu(update, context, "Выберите действие из меню 👇")
         return
 
@@ -334,38 +694,8 @@ async def handle_menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 [[InlineKeyboardButton("🔙 Отмена", callback_data="action:menu")]]
             ),
         )
-    elif action == "invoices":
-        invoices = service.list_invoices_for_user(user_id)
-        pending_invoices = [
-            inv for inv in invoices if inv.status.lower() not in PAID_INVOICE_STATUSES
-        ]
-        if not pending_invoices:
-            await query.message.edit_text(
-                "✅ У вас нет неоплаченных счетов.",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("⬅️ Назад", callback_data="action:menu")]]
-                ),
-            )
-            return
-        lines = ["💳 Ожидающие оплаты счета:"]
-        buttons = []
-        for inv in pending_invoices:
-            lines.append(
-                f"• #{inv.invoice_id} — {inv.amount:.2f} {inv.asset} ({inv.invoice_type})"
-            )
-            buttons.append(
-                [
-                    InlineKeyboardButton(
-                        f"Проверить #{inv.invoice_id}",
-                        callback_data=f"invoice:check:{inv.invoice_id}",
-                    )
-                ]
-            )
-        buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="action:menu")])
-        await query.message.edit_text(
-            "\n".join(lines),
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
+    elif action == "support":
+        await show_support_overview(update, context)
     elif action == "admin":
         if not is_admin_id(user_id, context):
             await query.answer("Доступ запрещён", show_alert=True)
@@ -373,6 +703,111 @@ async def handle_menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await show_admin_menu(update, context)
     else:
         await query.answer("Неизвестное действие", show_alert=True)
+
+
+async def handle_support_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ensure_dependencies(context)
+    query = update.callback_query
+    assert query is not None
+    await query.answer()
+
+    parts = query.data.split(":")
+    if len(parts) < 2:
+        await query.answer("Некорректный запрос", show_alert=True)
+        return
+
+    action = parts[1]
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id is None:
+        await query.answer("Не удалось определить пользователя", show_alert=True)
+        return
+
+    service = get_service(context)
+    user = service.get_user_balance(user_id)
+    if user is None:
+        await query.answer("Сначала используйте /start", show_alert=True)
+        await query.message.edit_text(
+            "❗️ Пользователь не найден. Нажмите /start для регистрации.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data="action:menu")]]
+            ),
+        )
+        return
+    if user.is_banned and not is_admin_id(user_id, context):
+        await query.answer("Ваш доступ ограничен", show_alert=True)
+        return
+
+    if action == "list":
+        await show_support_overview(update, context)
+        return
+
+    if action == "new":
+        context.user_data["support_new_ticket"] = True
+        context.user_data.pop("support_reply", None)
+        await query.message.edit_text(
+            "🆘 Опишите вашу проблему одним сообщением.\n"
+            "Напишите «отмена», чтобы вернуться в меню поддержки.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data="support:list")]]
+            ),
+        )
+        return
+
+    if action == "view" and len(parts) >= 3:
+        try:
+            ticket_id = int(parts[2])
+        except ValueError:
+            await query.answer("Некорректный тикет", show_alert=True)
+            return
+        await show_support_ticket_detail(update, context, ticket_id)
+        return
+
+    if action == "reply" and len(parts) >= 3:
+        try:
+            ticket_id = int(parts[2])
+        except ValueError:
+            await query.answer("Некорректный тикет", show_alert=True)
+            return
+        ticket = service.get_ticket(ticket_id)
+        if ticket is None or ticket.user_id != user_id:
+            await query.answer("Тикет не найден", show_alert=True)
+            return
+        if ticket.status != "open":
+            await query.answer("Тикет закрыт", show_alert=True)
+            return
+        context.user_data["support_reply"] = {"ticket_id": ticket_id}
+        await query.message.edit_text(
+            "✍️ Отправьте сообщение для поддержки.\n"
+            "Напишите «отмена», чтобы вернуться без изменений.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data=f"support:view:{ticket_id}")]]
+            ),
+        )
+        return
+
+    if action in {"close", "reopen"} and len(parts) >= 3:
+        try:
+            ticket_id = int(parts[2])
+        except ValueError:
+            await query.answer("Некорректный тикет", show_alert=True)
+            return
+        try:
+            if action == "close":
+                service.close_ticket(ticket_id, actor_user_id=user_id)
+                info = "✅ Тикет закрыт."
+            else:
+                service.reopen_ticket(ticket_id, actor_user_id=user_id)
+                info = "♻️ Тикет открыт вновь."
+        except PermissionError:
+            await query.answer("Недостаточно прав", show_alert=True)
+            return
+        except ValueError as exc:
+            await query.answer(str(exc), show_alert=True)
+            return
+        await show_support_ticket_detail(update, context, ticket_id, info=info)
+        return
+
+    await query.answer("Неизвестное действие", show_alert=True)
 
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -872,6 +1307,109 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = service.get_user_balance(user_id) if user_id is not None else None
     is_admin_user = is_admin_id(user_id, context) if user_id is not None else False
 
+    admin_reply_state = user_data.get("admin_ticket_reply")
+    if admin_reply_state:
+        if not is_admin_user:
+            user_data.pop("admin_ticket_reply", None)
+        else:
+            if not message.text:
+                await message.reply_text("Отправьте текст ответа или «отмена».")
+                return
+            raw = message.text.strip()
+            ticket_id = admin_reply_state.get("ticket_id")
+            if raw.lower() in {"отмена", "cancel"}:
+                user_data.pop("admin_ticket_reply", None)
+                await message.reply_text("Ответ отменён.")
+                if ticket_id is not None:
+                    await show_admin_ticket_detail(update, context, ticket_id)
+                return
+            if ticket_id is None:
+                user_data.pop("admin_ticket_reply", None)
+                await message.reply_text("Не удалось определить тикет.")
+                return
+            try:
+                ticket = service.add_ticket_message(ticket_id, "admin", raw)
+            except ValueError as exc:
+                await message.reply_text(str(exc))
+                return
+            user_data.pop("admin_ticket_reply", None)
+            await message.reply_text("Ответ отправлен пользователю.")
+            try:
+                await context.bot.send_message(
+                    chat_id=ticket.user_id,
+                    text="🆘 Поддержка: новый ответ от администратора.\n\n" + raw,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                LOGGER.warning("Не удалось отправить сообщение пользователю %s: %s", ticket.user_id, exc)
+            await show_admin_ticket_detail(
+                update,
+                context,
+                ticket_id,
+                info="Ответ администратора отправлен.",
+            )
+        return
+
+    support_new_state = user_data.get("support_new_ticket")
+    if support_new_state:
+        if not message.text:
+            await message.reply_text("Опишите вопрос текстом или напишите «отмена».")
+            return
+        raw = message.text.strip()
+        if raw.lower() in {"отмена", "cancel"}:
+            user_data.pop("support_new_ticket", None)
+            await message.reply_text("Создание тикета отменено.")
+            await show_support_overview(update, context)
+            return
+        if user_id is None:
+            user_data.pop("support_new_ticket", None)
+            await message.reply_text("Не удалось определить пользователя.")
+            return
+        try:
+            ticket = service.open_ticket(user_id, raw)
+        except ValueError as exc:
+            await message.reply_text(str(exc))
+            return
+        user_data.pop("support_new_ticket", None)
+        await show_support_ticket_detail(
+            update,
+            context,
+            ticket.ticket_id,
+            info="✅ Тикет создан. Ожидайте ответа администратора.",
+        )
+        return
+
+    support_reply_state = user_data.get("support_reply")
+    if support_reply_state:
+        if not message.text:
+            await message.reply_text("Отправьте текст сообщения или «отмена».")
+            return
+        raw = message.text.strip()
+        ticket_id = support_reply_state.get("ticket_id")
+        if raw.lower() in {"отмена", "cancel"}:
+            user_data.pop("support_reply", None)
+            if ticket_id is not None:
+                await show_support_ticket_detail(update, context, ticket_id)
+            else:
+                await show_support_overview(update, context)
+            return
+        if ticket_id is None:
+            user_data.pop("support_reply", None)
+            await message.reply_text("Не удалось определить тикет.")
+            return
+        try:
+            service.add_ticket_message(ticket_id, "user", raw)
+        except ValueError as exc:
+            await message.reply_text(str(exc))
+            return
+        user_data.pop("support_reply", None)
+        await show_support_ticket_detail(
+            update,
+            context,
+            ticket_id,
+            info="✉️ Сообщение отправлено. Мы ответим вам как можно скорее.",
+        )
+        return
+
     # Admin adjusts post price
     if user_data.get("awaiting_post_price"):
         if not message.text:
@@ -1264,13 +1802,14 @@ def admin_menu_keyboard(paused: bool) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🗂 Заявки", callback_data="admin:requests"),
             ],
             [
+                InlineKeyboardButton("🆘 Поддержка", callback_data="admin:support"),
                 InlineKeyboardButton("⚙️ Цены", callback_data="admin:prices"),
-                InlineKeyboardButton("💳 CryptoPay", callback_data="admin:cryptopay"),
             ],
             [
+                InlineKeyboardButton("💳 CryptoPay", callback_data="admin:cryptopay"),
                 InlineKeyboardButton("🔄 Обновить", callback_data="admin:refresh"),
-                InlineKeyboardButton("⬅️ В меню", callback_data="action:menu"),
             ],
+            [InlineKeyboardButton("⬅️ В меню", callback_data="action:menu")],
         ]
     )
 
@@ -1740,6 +2279,74 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
             await show_request_detail(update, context, index)
         else:
             await query.answer("Неизвестное действие", show_alert=True)
+    elif action == "support":
+        if not args:
+            await show_admin_support_overview(update, context)
+            return
+        subaction = args[0]
+        if subaction == "filter" and len(args) >= 2:
+            target = args[1]
+            if target not in {"open", "all"}:
+                await query.answer("Некорректный фильтр", show_alert=True)
+                return
+            context.user_data["admin_support_filter"] = target
+            context.user_data["admin_support_page"] = 0
+            await show_admin_support_overview(update, context)
+        elif subaction == "page" and len(args) >= 2:
+            try:
+                page = int(args[1])
+            except ValueError:
+                await query.answer("Некорректная страница", show_alert=True)
+                return
+            context.user_data["admin_support_page"] = page
+            await show_admin_support_overview(update, context)
+        elif subaction == "view" and len(args) >= 2:
+            try:
+                ticket_id = int(args[1])
+            except ValueError:
+                await query.answer("Некорректный тикет", show_alert=True)
+                return
+            await show_admin_ticket_detail(update, context, ticket_id)
+        elif subaction == "reply" and len(args) >= 2:
+            try:
+                ticket_id = int(args[1])
+            except ValueError:
+                await query.answer("Некорректный тикет", show_alert=True)
+                return
+            ticket = service.get_ticket(ticket_id)
+            if ticket is None:
+                await query.answer("Тикет не найден", show_alert=True)
+                return
+            if ticket.status != "open":
+                await query.answer("Тикет закрыт", show_alert=True)
+                return
+            context.user_data["admin_ticket_reply"] = {"ticket_id": ticket_id}
+            await query.message.edit_text(
+                "✍️ Отправьте ответ пользователю одним сообщением.\n"
+                "Напишите «отмена», чтобы выйти без изменений.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⬅️ Назад", callback_data=f"admin:support:view:{ticket_id}")]]
+                ),
+            )
+        elif subaction in {"close", "reopen"} and len(args) >= 2:
+            try:
+                ticket_id = int(args[1])
+            except ValueError:
+                await query.answer("Некорректный тикет", show_alert=True)
+                return
+            try:
+                if subaction == "close":
+                    service.close_ticket(ticket_id)
+                    info = "✅ Тикет закрыт."
+                else:
+                    service.reopen_ticket(ticket_id)
+                    info = "♻️ Тикет открыт вновь."
+            except ValueError as exc:
+                await query.answer(str(exc), show_alert=True)
+                return
+            await show_admin_ticket_detail(update, context, ticket_id, info=info)
+        else:
+            await query.answer("Неизвестное действие", show_alert=True)
     elif action == "cryptopay":
         token_configured = bool(os.environ.get("CRYPTOPAY_TOKEN"))
         info = (
@@ -1777,6 +2384,7 @@ def main() -> None:
     application.add_handler(CommandHandler("post", post))
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CallbackQueryHandler(handle_admin_callback, pattern="^admin:"))
+    application.add_handler(CallbackQueryHandler(handle_support_callback, pattern="^support:"))
     application.add_handler(CallbackQueryHandler(handle_invoice_check, pattern="^invoice:check:"))
     application.add_handler(CallbackQueryHandler(handle_menu_action, pattern="^action:"))
     application.add_handler(CallbackQueryHandler(handle_energy_selection, pattern="^energy:"))

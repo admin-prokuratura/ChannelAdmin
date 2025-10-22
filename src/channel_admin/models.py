@@ -89,6 +89,33 @@ class Invoice:
 
 
 @dataclass(slots=True)
+class TicketMessage:
+    message_id: int
+    ticket_id: int
+    sender: str
+    text: str
+    created_at: datetime = field(default_factory=utcnow)
+
+
+@dataclass(slots=True)
+class Ticket:
+    ticket_id: int
+    user_id: int
+    status: str = "open"
+    subject: str | None = None
+    created_at: datetime = field(default_factory=utcnow)
+    updated_at: datetime = field(default_factory=utcnow)
+    messages: list[TicketMessage] = field(default_factory=list)
+
+    def add_message(self, message: TicketMessage) -> None:
+        self.messages.append(message)
+        self.updated_at = message.created_at
+        if not self.subject and message.sender == "user":
+            preview = message.text.strip()
+            self.subject = preview[:80] if preview else None
+
+
+@dataclass(slots=True)
 class BotSettings:
     autopost_paused: bool = False
     post_energy_cost: int = 20
