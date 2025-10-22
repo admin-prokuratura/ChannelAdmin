@@ -1,0 +1,50 @@
+{
+  "users": {
+    "7480583172": {
+      "user_id": 7480583172,
+      "energy": 100,
+      "golden_cards": [],
+      "referred_users": [],
+      "is_banned": false,
+      "is_admin": false,
+      "username": "uglymove",
+      "full_name": "Прокуратура [Citadel-GSM]"
+    }
+  },
+  "posts": {},
+  "post_sequence": 1,
+  "invoices": {},
+  "tickets": {
+    "1": {
+      "ticket_id": 1,
+      "user_id": 7480583172,
+      "status": "closed",
+      "subject": "хуй",
+      "created_at": "2025-10-22T20:44:01.344499+00:00",
+      "updated_at": "2025-10-22T20:45:46.914335+00:00",
+      "messages": [
+        {
+          "message_id": 1,
+          "ticket_id": 1,
+          "sender": "user",
+          "text": "хуй",
+          "created_at": "2025-10-22T20:44:01.344499+00:00"
+        },
+        {
+          "message_id": 2,
+          "ticket_id": 1,
+          "sender": "admin",
+          "text": "хуй",
+          "created_at": "2025-10-22T20:45:39.588544+00:00"
+        }
+      ]
+    }
+  },
+  "settings": {
+    "autopost_paused": false,
+    "post_energy_cost": 20,
+    "energy_price_per_unit": 1.0
+  },
+  "ticket_sequence": 2,
+  "ticket_message_sequence": 3
+}
