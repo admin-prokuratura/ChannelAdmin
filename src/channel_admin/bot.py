@@ -18,12 +18,17 @@ from telegram.ext import (
     filters,
 )
 
+from dotenv import load_dotenv
+
 from .config import FilterConfig, PricingConfig
 from .services import ChannelEconomyService
 from .storage import InMemoryStorage
 from .payments import CryptoPayClient, CryptoPayError
 
 LOGGER = logging.getLogger(__name__)
+
+
+load_dotenv()
 
 
 def build_service() -> ChannelEconomyService:
