@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Dict, Iterable, Optional, Sequence
@@ -166,6 +168,15 @@ class ChannelEconomyService:
         self.storage.add_post(post)
         return post
 
+    def energy_cost_for_golden_card(self, duration: timedelta) -> int | None:
+        if duration <= timedelta(0):
+            raise ValueError("Golden card duration must be positive")
+        unit_price = self.pricing.energy_price_per_unit
+        if unit_price <= 0:
+            return None
+        price = self.pricing.price_for_golden_card(duration)
+        return max(1, math.ceil(price / unit_price))
+
     def purchase_golden_card(self, user_id: int, duration: timedelta) -> float:
         if duration <= timedelta(0):
             raise ValueError("Golden card duration must be positive")
@@ -176,6 +187,18 @@ class ChannelEconomyService:
         user.add_golden_card(GoldenCard(duration=duration))
         self.storage.save_user(user)
         return price
+
+    def purchase_golden_card_with_energy(self, user_id: int, duration: timedelta) -> int:
+        energy_cost = self.energy_cost_for_golden_card(duration)
+        if energy_cost is None:
+            raise ValueError("Оплата энергией недоступна")
+        user = self._get_or_create_user(user_id)
+        if user.is_banned:
+            raise ValueError("Пользователь заблокирован")
+        user.spend_energy(energy_cost)
+        user.add_golden_card(GoldenCard(duration=duration))
+        self.storage.save_user(user)
+        return energy_cost
 
     def grant_golden_card(self, user_id: int, duration: timedelta) -> User:
         if duration <= timedelta(0):
