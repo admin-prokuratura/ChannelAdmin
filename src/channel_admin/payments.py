@@ -99,7 +99,14 @@ class CryptoPayClient:
         if not payload_json.get("ok", False):
             raise CryptoPayError(payload_json.get("error", "Crypto Pay request failed"))
 
-        results = payload_json.get("result") or []
+        raw_results = payload_json.get("result") or []
+        if isinstance(raw_results, dict):
+            results = list(raw_results.values())
+        elif isinstance(raw_results, list):
+            results = raw_results
+        else:
+            results = []
+
         if not results:
             raise CryptoPayError(f"Invoice {invoice_id} not found")
 
