@@ -80,6 +80,18 @@ def test_golden_card_makes_post_pin(service: ChannelEconomyService) -> None:
     assert post.requires_pin
 
 
+def test_purchase_golden_card_with_energy(service: ChannelEconomyService) -> None:
+    service.purchase_energy(1, 200)
+    cost = service.energy_cost_for_golden_card(timedelta(hours=24))
+    assert cost is not None
+    spent = service.purchase_golden_card_with_energy(1, timedelta(hours=24))
+    assert spent == cost
+    user = service.get_user_balance(1)
+    assert user is not None
+    assert len(user.golden_cards) == 1
+    assert user.energy == 200 - cost
+
+
 def test_award_referral_only_once(service: ChannelEconomyService) -> None:
     service.award_referral(1, 2)
     service.award_referral(1, 2)

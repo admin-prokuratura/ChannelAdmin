@@ -546,11 +546,21 @@ async def handle_golden_selection(update: Update, context: ContextTypes.DEFAULT_
     service = get_service(context)
     user_id = update.effective_user.id if update.effective_user else None
     if user_id is None:
-        await query.message.reply_text("Не удалось определить пользователя. Попробуйте позже.")
+        await query.message.edit_text(
+            "Не удалось определить пользователя. Попробуйте позже.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ В меню", callback_data="action:menu")]]
+            ),
+        )
         return
     user = service.get_user_balance(user_id)
     if user is None:
-        await query.message.reply_text("Сначала зарегистрируйтесь командой /start.")
+        await query.message.edit_text(
+            "Сначала зарегистрируйтесь командой /start.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ В меню", callback_data="action:menu")]]
+            ),
+        )
         return
     if user.is_banned and not is_admin_id(user_id, context):
         await query.answer("Ваш доступ ограничен.", show_alert=True)
@@ -563,10 +573,138 @@ async def handle_golden_selection(update: Update, context: ContextTypes.DEFAULT_
         rub_total = service.pricing.convert_usd_to_rub(price)
     except ValueError:
         rub_total = None
+
+    energy_cost = service.energy_cost_for_golden_card(duration)
+
+    price_line = f"Стоимость: {price:.2f} $"
+    if rub_total is not None:
+        price_line += f" (~{rub_total:.2f} ₽)"
+
+    message_lines = [
+        f"🌟 Золотая карточка на {hours} ч",
+        "",
+        price_line,
+    ]
+
+    if energy_cost is not None:
+        message_lines.append(
+            f"Или оплатите {energy_cost}⚡️ из баланса (доступно: {user.energy}⚡️)."
+        )
+
+    message_lines.append("")
+    message_lines.append("Выберите способ оплаты:")
+
+    buttons = [
+        [
+            InlineKeyboardButton(
+                "💳 Оплатить USDT", callback_data=f"goldenpay:crypto:{hours}"
+            )
+        ]
+    ]
+    if energy_cost is not None:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"⚡️ Оплатить {energy_cost}⚡️",
+                    callback_data=f"goldenpay:energy:{hours}",
+                )
+            ]
+        )
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="action:golden_card")])
+
+    await query.message.edit_text(
+        "\n".join(message_lines), reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def handle_golden_payment_selection(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    ensure_dependencies(context)
+    query = update.callback_query
+    assert query is not None
+    await query.answer()
+
+    try:
+        _, method, hours_str = query.data.split(":", 2)
+        hours = int(hours_str)
+    except (ValueError, IndexError):
+        await query.answer("Некорректный выбор", show_alert=True)
+        return
+
+    service = get_service(context)
+    sync_user_profile(update, service)
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id is None:
+        await query.message.edit_text(
+            "Не удалось определить пользователя. Попробуйте позже.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ В меню", callback_data="action:menu")]]
+            ),
+        )
+        return
+
+    user = service.get_user_balance(user_id)
+    if user is None:
+        await query.message.edit_text(
+            "Сначала зарегистрируйтесь командой /start.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ В меню", callback_data="action:menu")]]
+            ),
+        )
+        return
+    if user.is_banned and not is_admin_id(user_id, context):
+        await query.answer("Ваш доступ ограничен.", show_alert=True)
+        return
+
+    duration = timedelta(hours=hours)
+    price = service.pricing.price_for_golden_card(duration)
+    rub_total = None
+    try:
+        rub_total = service.pricing.convert_usd_to_rub(price)
+    except ValueError:
+        rub_total = None
+
+    if method == "energy":
+        energy_cost = service.energy_cost_for_golden_card(duration)
+        if energy_cost is None:
+            await query.answer("Оплата энергией недоступна", show_alert=True)
+            return
+        if user.energy < energy_cost:
+            await query.answer(
+                f"Недостаточно энергии. Требуется {energy_cost}⚡️, доступно {user.energy}⚡️.",
+                show_alert=True,
+            )
+            return
+        try:
+            service.purchase_golden_card_with_energy(user_id, duration)
+        except ValueError as exc:
+            await query.answer(str(exc), show_alert=True)
+            return
+
+        updated_user = service.get_user_balance(user_id)
+        remaining = updated_user.energy if updated_user else max(0, user.energy - energy_cost)
+        await query.message.edit_text(
+            "✅ Золотая карточка активирована!\n"
+            f"Списано {energy_cost}⚡️. Карточка действует {hours} ч.\n"
+            f"Остаток энергии: {remaining}⚡️.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ В меню", callback_data="action:menu")]]
+            ),
+        )
+        return
+
+    if method != "crypto":
+        await query.answer("Неизвестный способ оплаты", show_alert=True)
+        return
+
     client = get_crypto_client(context)
     if client is None:
-        await query.message.reply_text(
-            "💤 Платёжный шлюз пока не настроен. Обратитесь к администратору."
+        await query.message.edit_text(
+            "💤 Платёжный шлюз пока не настроен. Обратитесь к администратору.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ В меню", callback_data="action:menu")]]
+            ),
         )
         return
 
@@ -577,7 +715,12 @@ async def handle_golden_selection(update: Update, context: ContextTypes.DEFAULT_
             payload=f"golden:{user_id}:{hours}",
         )
     except CryptoPayError as exc:
-        await query.message.reply_text(f"❌ Не удалось создать счёт: {exc}")
+        await query.message.edit_text(
+            f"❌ Не удалось создать счёт: {exc}",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ В меню", callback_data="action:menu")]]
+            ),
+        )
         return
 
     service.record_invoice(
@@ -607,13 +750,13 @@ async def handle_golden_selection(update: Update, context: ContextTypes.DEFAULT_
         ]
     )
 
-    price_line = f"Стоимость: {price:.2f} $"
+    amount_line = f"Стоимость: {price:.2f} $"
     if rub_total is not None:
-        price_line += f" (~{rub_total:.2f} ₽)"
+        amount_line += f" (~{rub_total:.2f} ₽)"
 
-    await query.message.reply_text(
+    await query.message.edit_text(
         "🌟 Счёт на золотую карточку готов!\n"
-        f"{price_line}\n"
+        f"{amount_line}\n"
         "После оплаты нажмите «Проверить оплату», чтобы активировать карточку.",
         reply_markup=keyboard,
     )
@@ -1625,6 +1768,9 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(handle_invoice_check, pattern="^invoice:check:"))
     application.add_handler(CallbackQueryHandler(handle_menu_action, pattern="^action:"))
     application.add_handler(CallbackQueryHandler(handle_energy_selection, pattern="^energy:"))
+    application.add_handler(
+        CallbackQueryHandler(handle_golden_payment_selection, pattern="^goldenpay:")
+    )
     application.add_handler(CallbackQueryHandler(handle_golden_selection, pattern="^golden:"))
     application.add_handler(
         MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, handle_user_message)
