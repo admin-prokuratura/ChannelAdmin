@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     AIORateLimiter,
     ApplicationBuilder,
@@ -27,7 +27,7 @@ from .config import FilterConfig, PricingConfig
 from .services import ChannelEconomyService
 from .storage import AbstractStorage, InMemoryStorage, JsonStorage
 from .payments import CryptoPayClient, CryptoPayError
-from .models import BotSettings, Invoice, Ticket, utcnow
+from .models import BotSettings, Invoice, Post, Ticket, utcnow
 
 LOGGER = logging.getLogger(__name__)
 
@@ -2135,41 +2135,30 @@ async def autopost_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     try:
-        if post.photo_file_id:
-            channel_message = await context.bot.send_photo(
-                chat_id=TELEGRAM_CHANNEL_ID,
-                photo=post.photo_file_id,
-                caption=post.text,
-                parse_mode=post.parse_mode,
-                reply_markup=keyboard,
-            )
-        else:
-            channel_message = await context.bot.send_message(
-                chat_id=TELEGRAM_CHANNEL_ID,
-                text=post.text,
-                parse_mode=post.parse_mode,
-                reply_markup=keyboard,
-            )
+        used_parse_mode = post.parse_mode
+
+        channel_message, used_parse_mode = await _deliver_post(
+            context,
+            chat_id=TELEGRAM_CHANNEL_ID,
+            post=post,
+            keyboard=keyboard,
+            parse_mode=used_parse_mode,
+        )
 
         chat_message_id = None
 
         if TELEGRAM_CHAT_ID is not None:
-            if post.photo_file_id:
-                chat_message = await context.bot.send_photo(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    photo=post.photo_file_id,
-                    caption=post.text,
-                    parse_mode=post.parse_mode,
-                    reply_markup=keyboard,
-                )
-            else:
-                chat_message = await context.bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text=post.text,
-                    parse_mode=post.parse_mode,
-                    reply_markup=keyboard,
-                )
+            chat_message, used_parse_mode = await _deliver_post(
+                context,
+                chat_id=TELEGRAM_CHAT_ID,
+                post=post,
+                keyboard=keyboard,
+                parse_mode=used_parse_mode,
+            )
             chat_message_id = chat_message.message_id
+
+        if used_parse_mode != post.parse_mode:
+            service.update_post_parse_mode(post.post_id, used_parse_mode)
 
         if post.requires_pin:
             try:
@@ -2189,6 +2178,53 @@ async def autopost_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as exc:  # pylint: disable=broad-except
         LOGGER.exception("Ошибка автопубликации поста %s: %s", post.post_id, exc)
         service.mark_post_failed(post.post_id)
+
+
+async def _deliver_post(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    post: Post,
+    keyboard: InlineKeyboardMarkup | None,
+    parse_mode: str | None,
+):
+    bot = context.bot
+
+    if post.photo_file_id:
+        send_fn = bot.send_photo
+        payload = {
+            "chat_id": chat_id,
+            "photo": post.photo_file_id,
+            "caption": post.text,
+            "reply_markup": keyboard,
+        }
+    else:
+        send_fn = bot.send_message
+        payload = {
+            "chat_id": chat_id,
+            "text": post.text,
+            "reply_markup": keyboard,
+        }
+
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+
+    try:
+        message = await send_fn(**payload)
+        return message, parse_mode
+    except BadRequest as exc:
+        error_message = str(exc)
+        if parse_mode and "Can't parse entities" in error_message:
+            LOGGER.warning(
+                "Не удалось отправить пост %s с parse_mode=%s: %s. Повтор без parse_mode.",
+                post.post_id,
+                parse_mode,
+                error_message,
+            )
+            payload = {key: value for key, value in payload.items() if key != "parse_mode"}
+            message = await send_fn(**payload)
+            return message, None
+        raise
 
 
 def admin_menu_keyboard(paused: bool) -> InlineKeyboardMarkup:
