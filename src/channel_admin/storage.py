@@ -12,12 +12,14 @@ from typing import Dict, Iterable, Optional
 
 from .models import (
     BotSettings,
+    ChimeraRecord,
     GoldenCard,
     Invoice,
     Post,
     Ticket,
     TicketMessage,
     User,
+    UserboxProfile,
     utcnow,
 )
 
@@ -302,6 +304,63 @@ def _deserialize_settings(payload: dict | None) -> BotSettings:
     )
 
 
+def _serialize_userbox_profile(profile: UserboxProfile | None) -> dict | None:
+    if profile is None:
+        return None
+    return {
+        "full_name": profile.full_name,
+        "birth_date": profile.birth_date,
+        "phone_numbers": list(profile.phone_numbers),
+        "address": profile.address,
+    }
+
+
+def _deserialize_userbox_profile(payload: dict | None) -> UserboxProfile | None:
+    if not payload:
+        return None
+    phone_numbers: list[str] = []
+    for value in payload.get("phone_numbers", []):
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped:
+                phone_numbers.append(stripped)
+    return UserboxProfile(
+        full_name=payload.get("full_name"),
+        birth_date=payload.get("birth_date"),
+        phone_numbers=phone_numbers,
+        address=payload.get("address"),
+    )
+
+
+def _serialize_chimera_record(record: ChimeraRecord) -> dict:
+    return {
+        "record_id": record.record_id,
+        "address_query": record.address_query,
+        "raw_results": deepcopy(record.raw_results),
+        "created_at": _datetime_to_iso(record.created_at),
+        "userbox_profile": _serialize_userbox_profile(record.userbox_profile),
+    }
+
+
+def _deserialize_chimera_record(payload: dict) -> ChimeraRecord:
+    raw_results = payload.get("raw_results")
+    if not isinstance(raw_results, list):
+        raw_results = []
+    normalized_results: list[dict[str, object]] = []
+    for item in raw_results:
+        if isinstance(item, dict):
+            normalized_results.append(dict(item))
+    profile = _deserialize_userbox_profile(payload.get("userbox_profile"))
+    return ChimeraRecord(
+        record_id=_safe_optional_int(payload.get("record_id")),
+        address_query=str(payload.get("address_query") or ""),
+        raw_results=normalized_results,
+        created_at=_iso_to_datetime(payload.get("created_at"))
+        or datetime.fromtimestamp(0, tz=timezone.utc),
+        userbox_profile=profile,
+    )
+
+
 class AbstractStorage:
     """Interface for persisting users and posts."""
 
@@ -378,6 +437,18 @@ class AbstractStorage:
     ) -> Optional[Ticket]:
         raise NotImplementedError
 
+    def add_chimera_record(self, record: ChimeraRecord) -> None:
+        raise NotImplementedError
+
+    def save_chimera_record(self, record: ChimeraRecord) -> None:
+        raise NotImplementedError
+
+    def get_chimera_record(self, record_id: int) -> Optional[ChimeraRecord]:
+        raise NotImplementedError
+
+    def list_chimera_records(self) -> Iterable[ChimeraRecord]:
+        raise NotImplementedError
+
 
 class InMemoryStorage(AbstractStorage):
     """Simple dictionary-based storage for demos and tests."""
@@ -391,6 +462,8 @@ class InMemoryStorage(AbstractStorage):
         self._tickets: Dict[int, Ticket] = {}
         self._ticket_sequence: int = 1
         self._ticket_message_sequence: int = 1
+        self._chimera_records: Dict[int, ChimeraRecord] = {}
+        self._chimera_sequence: int = 1
 
     def get_user(self, user_id: int) -> Optional[User]:
         user = self._users.get(user_id)
@@ -536,6 +609,31 @@ class InMemoryStorage(AbstractStorage):
         self._tickets[ticket_id] = deepcopy(ticket)
         return deepcopy(ticket)
 
+    def add_chimera_record(self, record: ChimeraRecord) -> None:
+        if record.record_id is None:
+            record.record_id = self._chimera_sequence
+            self._chimera_sequence += 1
+        self._chimera_records[record.record_id] = deepcopy(record)
+
+    def save_chimera_record(self, record: ChimeraRecord) -> None:
+        if record.record_id is None:
+            raise ValueError("Chimera record must have an id before saving")
+        self._chimera_records[record.record_id] = deepcopy(record)
+
+    def get_chimera_record(self, record_id: int) -> Optional[ChimeraRecord]:
+        record = self._chimera_records.get(record_id)
+        if record is None:
+            return None
+        return deepcopy(record)
+
+    def list_chimera_records(self) -> Iterable[ChimeraRecord]:
+        return [
+            deepcopy(record)
+            for record in sorted(
+                self._chimera_records.values(), key=lambda rec: rec.created_at
+            )
+        ]
+
 
 class JsonStorage(InMemoryStorage):
     """JSON-backed storage persisted on disk."""
@@ -564,6 +662,11 @@ class JsonStorage(InMemoryStorage):
             "settings": _serialize_settings(self._settings),
             "ticket_sequence": self._ticket_sequence,
             "ticket_message_sequence": self._ticket_message_sequence,
+            "chimera_records": {
+                str(record_id): _serialize_chimera_record(record)
+                for record_id, record in self._chimera_records.items()
+            },
+            "chimera_sequence": self._chimera_sequence,
         }
         temp_path = self._path.with_suffix(self._path.suffix + ".tmp")
         try:
@@ -617,6 +720,14 @@ class JsonStorage(InMemoryStorage):
                 for ticket_id, ticket_payload in raw_tickets.items()
             }
 
+            raw_chimera = payload.get("chimera_records", {}) or {}
+            self._chimera_records = {
+                int(record_id): _deserialize_chimera_record(
+                    {"record_id": int(record_id), **record_payload}
+                )
+                for record_id, record_payload in raw_chimera.items()
+            }
+
             stored_sequence = payload.get("post_sequence")
             if isinstance(stored_sequence, int) and stored_sequence > 0:
                 self._post_sequence = stored_sequence
@@ -647,6 +758,16 @@ class JsonStorage(InMemoryStorage):
                         default=0,
                     )
                     + 1
+                )
+
+            chimera_sequence = payload.get("chimera_sequence")
+            if isinstance(chimera_sequence, int) and chimera_sequence > 0:
+                self._chimera_sequence = chimera_sequence
+            else:
+                self._chimera_sequence = (
+                    max(self._chimera_records.keys(), default=0) + 1
+                    if self._chimera_records
+                    else 1
                 )
 
             self._settings = _deserialize_settings(payload.get("settings"))
@@ -693,3 +814,11 @@ class JsonStorage(InMemoryStorage):
         if ticket is not None:
             self._persist()
         return ticket
+
+    def add_chimera_record(self, record: ChimeraRecord) -> None:
+        super().add_chimera_record(record)
+        self._persist()
+
+    def save_chimera_record(self, record: ChimeraRecord) -> None:
+        super().save_chimera_record(record)
+        self._persist()

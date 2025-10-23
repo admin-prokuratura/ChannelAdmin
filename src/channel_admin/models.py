@@ -122,3 +122,24 @@ class BotSettings:
     energy_price_per_unit: float = 1.0
     subscription_chat_id: str | None = None
     subscription_invite_link: str | None = None
+
+
+@dataclass(slots=True)
+class UserboxProfile:
+    """Normalized data fetched from the Usersbox service."""
+
+    full_name: str | None = None
+    birth_date: str | None = None
+    phone_numbers: list[str] = field(default_factory=list)
+    address: str | None = None
+
+
+@dataclass(slots=True)
+class ChimeraRecord:
+    """Result of an address lookup performed in the Chimera tool."""
+
+    address_query: str
+    raw_results: list[dict[str, object]] = field(default_factory=list)
+    created_at: datetime = field(default_factory=utcnow)
+    record_id: int | None = None
+    userbox_profile: UserboxProfile | None = None

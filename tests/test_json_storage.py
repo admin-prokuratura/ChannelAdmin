@@ -4,7 +4,16 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from channel_admin.models import BotSettings, GoldenCard, Invoice, Post, User, utcnow
+from channel_admin.models import (
+    BotSettings,
+    ChimeraRecord,
+    GoldenCard,
+    Invoice,
+    Post,
+    User,
+    UserboxProfile,
+    utcnow,
+)
 from channel_admin.storage import JsonStorage
 
 
@@ -79,3 +88,28 @@ def test_json_storage_persists_between_sessions(tmp_path) -> None:
     new_post = Post(user_id=1, text="Another")
     fresh_storage.add_post(new_post)
     assert new_post.post_id == (post.post_id or 0) + 1
+
+
+def test_json_storage_persists_chimera_records(tmp_path) -> None:
+    db_path = tmp_path / "storage.json"
+    storage = JsonStorage(db_path)
+
+    record = ChimeraRecord(address_query="Москва, ул. Пушкина", raw_results=[{"flat": "12"}])
+    storage.add_chimera_record(record)
+    record.userbox_profile = UserboxProfile(
+        full_name="Иван Иванов",
+        birth_date="01.01.1990",
+        phone_numbers=["+79990001122", " "],
+        address="Москва",
+    )
+    storage.save_chimera_record(record)
+
+    reloaded = JsonStorage(db_path)
+    records = list(reloaded.list_chimera_records())
+    assert len(records) == 1
+    loaded = records[0]
+    assert loaded.record_id == record.record_id
+    assert loaded.address_query == "Москва, ул. Пушкина"
+    assert loaded.userbox_profile is not None
+    assert loaded.userbox_profile.full_name == "Иван Иванов"
+    assert loaded.userbox_profile.phone_numbers == ["+79990001122"]
