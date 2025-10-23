@@ -83,6 +83,20 @@ DEFAULT_JSON_STORAGE_PATH = Path.home() / ".channel_admin" / "storage.json"
 GOLDEN_CARD_PRESETS: tuple[int, ...] = (12, 24, 72)
 
 
+def _candidate_storage_paths() -> list[Path]:
+    if JSON_STORAGE_PATH:
+        return [Path(JSON_STORAGE_PATH).expanduser()]
+
+    candidates: list[Path] = []
+
+    cwd_storage = Path.cwd() / "data" / "storage.json"
+    candidates.append(cwd_storage)
+
+    candidates.append(DEFAULT_JSON_STORAGE_PATH)
+
+    return candidates
+
+
 def _format_rubles(amount: float | None) -> str:
     if amount is None:
         return ""
@@ -259,13 +273,20 @@ def build_service() -> ChannelEconomyService:
 
 
 def build_storage() -> AbstractStorage:
-    storage_path = Path(JSON_STORAGE_PATH) if JSON_STORAGE_PATH else DEFAULT_JSON_STORAGE_PATH
-    try:
-        return JsonStorage(storage_path)
-    except Exception as exc:  # pragma: no cover - defensive
-        LOGGER.error(
-            "Failed to initialise JSON storage at %s: %s", storage_path, exc
-        )
+    for storage_path in _candidate_storage_paths():
+        try:
+            storage = JsonStorage(storage_path)
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.error(
+                "Failed to initialise JSON storage at %s: %s", storage_path, exc
+            )
+            continue
+        LOGGER.info("Using JSON storage at %s", storage_path)
+        return storage
+
+    LOGGER.warning(
+        "Falling back to in-memory storage; data will not persist between restarts."
+    )
     return InMemoryStorage()
 
 

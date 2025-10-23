@@ -35,6 +35,21 @@ Then start the bot:
 python -m channel_admin.bot
 ```
 
+### Data persistence
+
+The bot keeps its state in a JSON file so that user balances, administrator
+flags, posts, tickets and subscription settings survive restarts.  Set the
+`JSON_STORAGE_PATH` variable in your `.env` file to choose where the data is
+stored:
+
+```env
+JSON_STORAGE_PATH=/absolute/path/to/storage.json
+```
+
+If the variable is not provided, the bot writes to `data/storage.json` inside
+the current working directory.  When that directory cannot be created, it
+falls back to `~/.channel_admin/storage.json`.
+
 The sample bot now guides the user through an emoji-rich inline menu. All core actions are available as buttons, while legacy
 slash commands remain for compatibility:
 
