@@ -1,12 +1,16 @@
 """Executable Telegram bot wiring for the Channel Admin service."""
 
 from __future__ import annotations
+import html
 import logging
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
+from telegram.error import TelegramError
 from telegram.ext import (
     AIORateLimiter,
     ApplicationBuilder,
@@ -23,7 +27,7 @@ from .config import FilterConfig, PricingConfig
 from .services import ChannelEconomyService
 from .storage import AbstractStorage, InMemoryStorage, JsonStorage
 from .payments import CryptoPayClient, CryptoPayError
-from .models import Invoice, Ticket, utcnow
+from .models import BotSettings, Invoice, Ticket, utcnow
 
 LOGGER = logging.getLogger(__name__)
 
@@ -75,9 +79,170 @@ TELEGRAM_CHAT_ID: int | None = _parse_int_env("TELEGRAM_CHAT_ID")
 AUTOPOST_INTERVAL_SECONDS: int = max(int(os.environ.get("AUTOPOST_INTERVAL_SECONDS", "60")), 10)
 PAID_INVOICE_STATUSES: set[str] = {"paid", "completed"}
 JSON_STORAGE_PATH: str | None = os.environ.get("JSON_STORAGE_PATH")
-DEFAULT_JSON_STORAGE_PATH = (
-    Path(__file__).resolve().parent.parent / "data" / "storage.json"
-)
+DEFAULT_JSON_STORAGE_PATH = Path.home() / ".channel_admin" / "storage.json"
+GOLDEN_CARD_PRESETS: tuple[int, ...] = (12, 24, 72)
+
+
+def _format_rubles(amount: float | None) -> str:
+    if amount is None:
+        return ""
+    formatted = f"{amount:.2f}".rstrip("0").rstrip(".")
+    return formatted or "0"
+
+
+def _subscription_link(settings: BotSettings) -> str | None:
+    if settings.subscription_invite_link:
+        return settings.subscription_invite_link
+    chat_id = settings.subscription_chat_id
+    if not chat_id:
+        return None
+    if isinstance(chat_id, str) and chat_id.startswith("@"):
+        slug = chat_id[1:]
+        return f"https://t.me/{slug}" if slug else None
+    if isinstance(chat_id, str) and not chat_id.startswith("-"):
+        return f"https://t.me/{chat_id}"
+    return None
+
+
+def _parse_subscription_input(raw: str) -> tuple[str, str | None]:
+    cleaned = raw.strip()
+    if not cleaned:
+        raise ValueError("Отправьте @username, числовой ID или ссылку на канал.")
+
+    parts = cleaned.split()
+    chat_candidate: str | None = None
+    link_candidate: str | None = None
+
+    for part in parts:
+        if part.startswith(("http://", "https://")):
+            link_candidate = part
+        elif chat_candidate is None:
+            chat_candidate = part
+
+    chat_id: str | None = None
+    invite_link: str | None = link_candidate
+
+    if invite_link:
+        parsed = urlparse(invite_link)
+        slug = parsed.path.strip("/")
+        if parsed.netloc in {"t.me", "telegram.me"} and slug and not slug.startswith("+"):
+            chat_id = f"@{slug}"
+
+    if chat_candidate:
+        candidate = chat_candidate
+        if candidate.startswith("@"):
+            chat_id = candidate
+        elif candidate.lstrip("-").isdigit():
+            chat_id = candidate
+        else:
+            chat_id = f"@{candidate}"
+
+    if chat_id is None:
+        raise ValueError(
+            "Не удалось определить идентификатор канала. "
+            "Укажите @username, числовой ID или добавьте ссылку формата https://t.me/..."
+        )
+
+    if invite_link is None and chat_id.startswith("@"):
+        invite_link = f"https://t.me/{chat_id[1:]}" if len(chat_id) > 1 else None
+
+    return chat_id, invite_link
+
+
+async def send_subscription_prompt(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    settings: BotSettings,
+    *,
+    error: str | None = None,
+) -> None:
+    link = _subscription_link(settings)
+    channel_label = settings.subscription_invite_link or settings.subscription_chat_id or "каналу"
+    lines = [
+        "🔒 <b>Доступ только для подписчиков</b>",
+        "Подпишитесь на канал, чтобы пользоваться ботом.",
+        f"Сейчас доступ открыт только подписчикам: <b>{html.escape(str(channel_label))}</b>.",
+        "После подписки вернитесь в бот и нажмите «🔄 Проверить подписку».",
+    ]
+    if error:
+        lines.append("")
+        lines.append(f"⚠️ {html.escape(error)}")
+
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    if link:
+        keyboard_rows.append([InlineKeyboardButton("📢 Открыть канал", url=link)])
+    keyboard_rows.append(
+        [InlineKeyboardButton("🔄 Проверить подписку", callback_data="action:check_subscription")]
+    )
+
+    text = "\n\n".join(lines)
+    markup = InlineKeyboardMarkup(keyboard_rows)
+
+    if update.callback_query:
+        await update.callback_query.message.edit_text(
+            text,
+            reply_markup=markup,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    elif update.message:
+        await update.message.reply_text(
+            text,
+            reply_markup=markup,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+
+
+async def ensure_subscription(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    show_prompt: bool = True,
+) -> bool:
+    ensure_dependencies(context)
+    service = get_service(context)
+    settings = service.current_settings or service.get_settings()
+    requirement = settings.subscription_chat_id
+    if not requirement:
+        return True
+
+    user = update.effective_user
+    if user is None:
+        return False
+
+    target_chat: str | int = requirement
+    if isinstance(requirement, str) and requirement.lstrip("-").isdigit():
+        try:
+            target_chat = int(requirement)
+        except ValueError:
+            target_chat = requirement
+
+    try:
+        member = await context.bot.get_chat_member(target_chat, user.id)
+    except TelegramError as exc:
+        LOGGER.warning("Failed to verify subscription for %s: %s", user.id, exc)
+        if show_prompt:
+            await send_subscription_prompt(
+                update,
+                context,
+                settings,
+                error="Не удалось проверить подписку. Попробуйте снова позже.",
+            )
+        return False
+
+    status = getattr(member, "status", None)
+    is_member = getattr(member, "is_member", None)
+    subscribed = status not in {"left", "kicked"}
+    if is_member is not None:
+        subscribed = subscribed and bool(is_member)
+
+    if not subscribed:
+        if show_prompt:
+            await send_subscription_prompt(update, context, settings)
+        return False
+
+    return True
 
 
 def build_service() -> ChannelEconomyService:
@@ -562,12 +727,68 @@ async def show_admin_ticket_detail(
 async def send_main_menu(
     update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
 ) -> None:
-    user_id = update.effective_user.id if update.effective_user else None
+    ensure_dependencies(context)
+    service = get_service(context)
+    tg_user = update.effective_user
+    user = service.get_user_balance(tg_user.id) if tg_user else None
+    user_id = tg_user.id if tg_user else None
     keyboard = main_menu_keyboard(is_admin=is_admin_id(user_id, context))
+
+    energy = user.energy if user else 0
+    active_cards = (
+        sum(1 for card in user.golden_cards if card.expires_at > utcnow())
+        if user
+        else 0
+    )
+    total_cards = len(user.golden_cards) if user else 0
+    display_name = (
+        user.full_name
+        or (tg_user.full_name if tg_user else None)
+        or (tg_user.username if tg_user else None)
+        or "Пользователь"
+    )
+
+    post_cost = service.post_energy_cost
+    rub_note = None
+    if service.current_settings and service.current_settings.energy_price_per_unit > 0:
+        rub_note = service.current_settings.energy_price_per_unit * post_cost
+
+    cost_line = f"{post_cost} ⚡️"
+    if rub_note:
+        cost_line += f" (~{_format_rubles(rub_note)} ₽)"
+
+    lines = [
+        "✨ <b>Главное меню</b>",
+        f"👤 <b>{html.escape(display_name)}</b>",
+        "",
+        f"⚡️ Энергия: <b>{energy}</b>",
+        f"🌟 Золотые карточки: <b>{active_cards}</b> из {total_cards}",
+        f"🧾 Стоимость поста: <b>{cost_line}</b>",
+    ]
+
+    if text:
+        lines.append("")
+        lines.append(html.escape(text, quote=False))
+
+    lines.append("")
+    lines.append("Выберите нужный раздел на клавиатуре ниже.")
+
+    menu_text = "\n".join(lines)
+
     if update.message:
-        await update.message.reply_text(text, reply_markup=keyboard)
+        await update.message.reply_text(
+            menu_text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
     elif update.callback_query:
-        await update.callback_query.message.edit_text(text, reply_markup=keyboard)
+        await update.callback_query.message.edit_text(
+            menu_text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
 
 
 def get_service(context: ContextTypes.DEFAULT_TYPE) -> ChannelEconomyService:
@@ -590,6 +811,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.message:
             await update.message.reply_text("Не удалось определить пользователя.")
         return
+    if not await ensure_subscription(update, context):
+        return
     full_name = _clean_full_name(tg_user.full_name)
     try:
         service.register_user(
@@ -608,9 +831,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Ваш доступ к боту ограничен.")
         return
     await update.message.reply_text(
-        "👋 Добро пожаловать!\n"
+        "👋 Добро пожаловать! Давайте начнём работу с ботом.",
+        disable_web_page_preview=True,
     )
-    await send_main_menu(update, context, "Выберите действие из меню 👇")
+    await send_main_menu(update, context, "Выберите раздел ниже")
 
 
 async def handle_menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -619,6 +843,19 @@ async def handle_menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
     assert query is not None
     await query.answer()
     action = query.data.split(":", 1)[1]
+
+    if action == "check_subscription":
+        if await ensure_subscription(update, context, show_prompt=False):
+            await send_main_menu(
+                update,
+                context,
+                "✅ Подписка подтверждена! Выберите действие.",
+            )
+        else:
+            service = get_service(context)
+            settings = service.current_settings or service.get_settings()
+            await send_subscription_prompt(update, context, settings)
+        return
 
     if action == "menu":
         context.user_data.pop("post_creation", None)
@@ -629,7 +866,11 @@ async def handle_menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data.pop("support_new_ticket", None)
         context.user_data.pop("support_reply", None)
         context.user_data.pop("admin_ticket_reply", None)
+        context.user_data.pop("awaiting_subscription_target", None)
         await send_main_menu(update, context, "Выберите действие из меню 👇")
+        return
+
+    if not await ensure_subscription(update, context):
         return
 
     service = get_service(context)
@@ -638,6 +879,7 @@ async def handle_menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if user_id is None:
         await query.answer("Не удалось определить пользователя", show_alert=True)
         return
+
     user = service.get_user_balance(user_id)
     if user is None and action != "admin":
         await query.message.edit_text(
@@ -647,6 +889,7 @@ async def handle_menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
             ),
         )
         return
+
     if user and user.is_banned and action != "admin" and not is_admin_id(user_id, context):
         await query.message.edit_text(
             "🚫 Ваш доступ к функциям бота ограничен.",
@@ -655,6 +898,7 @@ async def handle_menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
             ),
         )
         return
+
     if action == "balance":
         if not user:
             await query.message.edit_text(
@@ -665,44 +909,109 @@ async def handle_menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return
         active_cards = sum(1 for card in user.golden_cards if card.expires_at > utcnow())
+        total_cards = len(user.golden_cards)
+        post_cost = service.post_energy_cost
+        rub_note = None
+        if service.current_settings and service.current_settings.energy_price_per_unit > 0:
+            rub_note = service.current_settings.energy_price_per_unit * post_cost
+        cost_line = f"{post_cost} ⚡️"
+        if rub_note:
+            cost_line += f" (~{_format_rubles(rub_note)} ₽)"
         await query.message.edit_text(
-            "📊 Ваш баланс:\n"
-            f"• ⚡️ Энергия: {user.energy}\n"
-            f"• 🌟 Активные золотые карточки: {active_cards}",
+            "\n".join(
+                [
+                    "📊 <b>Ваш профиль</b>",
+                    f"⚡️ Энергия: <b>{user.energy}</b>",
+                    f"🌟 Активные карточки: <b>{active_cards}</b> из {total_cards}",
+                    f"🧾 Стоимость поста: <b>{cost_line}</b>",
+                ]
+            ),
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("🔙 В меню", callback_data="action:menu")]]
             ),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
         )
-    elif action == "energy":
+        return
+
+    if action == "energy":
         await query.message.edit_text(
-            "⚡️ Выберите пакет энергии для пополнения или укажите свою сумму:",
+            "⚡️ <b>Пополнение энергии</b>\n\n"
+            "Выберите готовый пакет или введите свою сумму.",
             reply_markup=energy_keyboard(),
+            parse_mode=ParseMode.HTML,
         )
-    elif action == "golden_card":
+        return
+
+    if action == "golden_card":
+        active_cards = (
+            sum(1 for card in user.golden_cards if card.expires_at > utcnow())
+            if user
+            else 0
+        )
+        lines = [
+            "🌟 <b>Золотая карточка</b>",
+            "Гарантирует закрепление вашего следующего поста в канале на выбранный срок.",
+            "Позволяет выделиться в ленте и привлечь максимум внимания.",
+            "",
+            f"Сейчас активных карточек: <b>{active_cards}</b>",
+            "",
+            "Доступные варианты:",
+        ]
+        for hours in GOLDEN_CARD_PRESETS:
+            duration = timedelta(hours=hours)
+            price_usd = service.pricing.price_for_golden_card(duration)
+            price_rub = service.pricing.convert_usd_to_rub(price_usd)
+            energy_cost = service.energy_cost_for_golden_card(duration)
+            price_text = _format_rubles(price_rub)
+            note = f"~{price_text} ₽" if price_text else None
+            energy_text = f" или {energy_cost}⚡️" if energy_cost else ""
+            price_label = note or f"{price_usd:.2f} $"
+            lines.append(f"• {hours} ч — {price_label}{energy_text}")
         await query.message.edit_text(
-            "🌟 Выберите длительность золотой карточки:",
+            "\n".join(lines),
             reply_markup=golden_card_keyboard(),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
         )
-    elif action == "post":
+        return
+
+    if action == "post":
         context.user_data["post_creation"] = {"step": "awaiting_content"}
+        post_cost = service.post_energy_cost
+        rub_note = None
+        if service.current_settings and service.current_settings.energy_price_per_unit > 0:
+            rub_note = service.current_settings.energy_price_per_unit * post_cost
+        cost_line = f"{post_cost} ⚡️"
+        if rub_note:
+            cost_line += f" (~{_format_rubles(rub_note)} ₽)"
         await query.message.edit_text(
-            "📝 Отправьте текст поста одним сообщением.\n"
-            "• Можно использовать HTML-разметку: <b>жирный</b>, <i>курсив</i>, <u>подчёркнутый</u>, <code>код</code>.\n"
-            "• Чтобы добавить фото — пришлите изображение с подписью (подпись станет текстом поста).\n"
-            "После текста я предложу добавить кнопку.",
+            "📝 <b>Создание поста</b>\n"
+            f"Стоимость публикации составит <b>{cost_line}</b>.\n\n"
+            "Отправьте текст одним сообщением.\n"
+            "• Поддерживается HTML-разметка: &lt;b&gt;жирный&lt;/b&gt;, &lt;i&gt;курсив&lt;/i&gt;, &lt;u&gt;подчёркнутый&lt;/u&gt;, &lt;code&gt;код&lt;/code&gt;.\n"
+            "• Чтобы добавить фото — пришлите изображение с подписью (она станет текстом).\n"
+            "После текста предложу добавить кнопку.",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("🔙 Отмена", callback_data="action:menu")]]
             ),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
         )
-    elif action == "support":
+        return
+
+    if action == "support":
         await show_support_overview(update, context)
-    elif action == "admin":
+        return
+
+    if action == "admin":
         if not is_admin_id(user_id, context):
             await query.answer("Доступ запрещён", show_alert=True)
             return
         await show_admin_menu(update, context)
-    else:
-        await query.answer("Неизвестное действие", show_alert=True)
+        return
+
+    await query.answer("Неизвестное действие", show_alert=True)
 
 
 async def handle_support_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -710,6 +1019,9 @@ async def handle_support_callback(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     assert query is not None
     await query.answer()
+
+    if not await ensure_subscription(update, context):
+        return
 
     parts = query.data.split(":")
     if len(parts) < 2:
@@ -811,6 +1123,9 @@ async def handle_support_callback(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ensure_dependencies(context)
+    if not await ensure_subscription(update, context):
+        return
     service = get_service(context)
     user = service.get_user_balance(update.effective_user.id)
     if not user:
@@ -820,14 +1135,32 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("🚫 Ваш доступ к боту ограничен.")
         return
     active_cards = sum(1 for card in user.golden_cards if card.expires_at > utcnow())
+    total_cards = len(user.golden_cards)
+    post_cost = service.post_energy_cost
+    rub_note = None
+    if service.current_settings and service.current_settings.energy_price_per_unit > 0:
+        rub_note = service.current_settings.energy_price_per_unit * post_cost
+    cost_line = f"{post_cost} ⚡️"
+    if rub_note:
+        cost_line += f" (~{_format_rubles(rub_note)} ₽)"
     await update.message.reply_text(
-        "📊 Баланс\n"
-        f"• ⚡️ Энергия: {user.energy}\n"
-        f"• 🌟 Активных золотых карточек: {active_cards}"
+        "\n".join(
+            [
+                "📊 <b>Ваш профиль</b>",
+                f"⚡️ Энергия: <b>{user.energy}</b>",
+                f"🌟 Активные карточки: <b>{active_cards}</b> из {total_cards}",
+                f"🧾 Стоимость поста: <b>{cost_line}</b>",
+            ]
+        ),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
     )
 
 
 async def buy_energy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ensure_dependencies(context)
+    if not await ensure_subscription(update, context):
+        return
     service = get_service(context)
     if not context.args:
         await update.message.reply_text("Укажите количество энергии: /buy_energy 50")
@@ -845,6 +1178,9 @@ async def buy_energy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def buy_golden_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ensure_dependencies(context)
+    if not await ensure_subscription(update, context):
+        return
     service = get_service(context)
     if not context.args:
         await update.message.reply_text("Укажите длительность в часах: /buy_golden_card 24")
@@ -862,10 +1198,23 @@ async def buy_golden_card(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ensure_dependencies(context)
+    if not await ensure_subscription(update, context):
+        return
     service = get_service(context)
     sync_user_profile(update, service)
     if not context.args:
-        await update.message.reply_text("Укажите текст поста после команды /post")
+        post_cost = service.post_energy_cost
+        rub_note = None
+        if service.current_settings and service.current_settings.energy_price_per_unit > 0:
+            rub_note = service.current_settings.energy_price_per_unit * post_cost
+        cost_line = f"{post_cost} ⚡️"
+        if rub_note:
+            cost_line += f" (~{_format_rubles(rub_note)} ₽)"
+        await update.message.reply_text(
+            "📝 Укажите текст поста после команды /post.\n"
+            f"Стоимость публикации: {cost_line}.",
+        )
         return
     message = " ".join(context.args)
     try:
@@ -874,7 +1223,10 @@ async def post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(str(exc))
         return
     pin_text = " Пост будет закреплён." if new_post.requires_pin else ""
-    await update.message.reply_text(f"Пост одобрен и будет отправлен в канал.{pin_text}")
+    await update.message.reply_text(
+        f"Пост одобрен и будет отправлен в канал.{pin_text}\n"
+        f"Списано {service.post_energy_cost}⚡️."
+    )
 
 
 async def handle_energy_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -882,6 +1234,8 @@ async def handle_energy_selection(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     assert query is not None
     await query.answer()
+    if not await ensure_subscription(update, context):
+        return
     try:
         data = query.data.split(":", 1)[1]
     except (ValueError, IndexError):
@@ -984,6 +1338,8 @@ async def handle_golden_selection(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     assert query is not None
     await query.answer()
+    if not await ensure_subscription(update, context):
+        return
     try:
         hours = int(query.data.split(":", 1)[1])
     except (ValueError, IndexError):
@@ -1023,19 +1379,20 @@ async def handle_golden_selection(update: Update, context: ContextTypes.DEFAULT_
 
     energy_cost = service.energy_cost_for_golden_card(duration)
 
-    price_line = f"Стоимость: {price:.2f} $"
+    price_line = f"💳 Стоимость: <b>{price:.2f} $</b>"
     if rub_total is not None:
-        price_line += f" (~{rub_total:.2f} ₽)"
+        price_line += f" (~{_format_rubles(rub_total)} ₽)"
 
     message_lines = [
-        f"🌟 Золотая карточка на {hours} ч",
+        f"🌟 <b>Золотая карточка на {hours} ч</b>",
+        "Зафиксирует ваш ближайший пост в топе канала на весь выбранный срок.",
         "",
         price_line,
     ]
 
     if energy_cost is not None:
         message_lines.append(
-            f"Или оплатите {energy_cost}⚡️ из баланса (доступно: {user.energy}⚡️)."
+            f"⚡️ Или списать <b>{energy_cost}⚡️</b> с баланса (доступно {user.energy}⚡️)."
         )
 
     message_lines.append("")
@@ -1060,7 +1417,10 @@ async def handle_golden_selection(update: Update, context: ContextTypes.DEFAULT_
     buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="action:golden_card")])
 
     await query.message.edit_text(
-        "\n".join(message_lines), reply_markup=InlineKeyboardMarkup(buttons)
+        "\n".join(message_lines),
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
     )
 
 
@@ -1071,6 +1431,8 @@ async def handle_golden_payment_selection(
     query = update.callback_query
     assert query is not None
     await query.answer()
+    if not await ensure_subscription(update, context):
+        return
 
     try:
         _, method, hours_str = query.data.split(":", 2)
@@ -1132,12 +1494,14 @@ async def handle_golden_payment_selection(
         updated_user = service.get_user_balance(user_id)
         remaining = updated_user.energy if updated_user else max(0, user.energy - energy_cost)
         await query.message.edit_text(
-            "✅ Золотая карточка активирована!\n"
-            f"Списано {energy_cost}⚡️. Карточка действует {hours} ч.\n"
-            f"Остаток энергии: {remaining}⚡️.",
+            "✅ <b>Золотая карточка активирована!</b>\n"
+            f"Списано <b>{energy_cost}⚡️</b>. Карточка действует <b>{hours} ч</b>.\n"
+            f"Остаток энергии: <b>{remaining}⚡️</b>.",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("⬅️ В меню", callback_data="action:menu")]]
             ),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
         )
         return
 
@@ -1197,15 +1561,17 @@ async def handle_golden_payment_selection(
         ]
     )
 
-    amount_line = f"Стоимость: {price:.2f} $"
+    amount_line = f"Стоимость: <b>{price:.2f} $</b>"
     if rub_total is not None:
-        amount_line += f" (~{rub_total:.2f} ₽)"
+        amount_line += f" (~{_format_rubles(rub_total)} ₽)"
 
     await query.message.edit_text(
-        "🌟 Счёт на золотую карточку готов!\n"
+        "🌟 <b>Счёт на золотую карточку готов!</b>\n"
         f"{amount_line}\n"
-        "После оплаты нажмите «Проверить оплату», чтобы активировать карточку.",
+        "После оплаты нажмите «🔄 Проверить оплату», чтобы активировать карточку.",
         reply_markup=keyboard,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
     )
 
 
@@ -1214,6 +1580,8 @@ async def handle_invoice_check(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     assert query is not None
     await query.answer()
+    if not await ensure_subscription(update, context):
+        return
 
     try:
         invoice_id = int(query.data.split(":", 2)[2])
@@ -1302,6 +1670,8 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     message = update.message
     if message is None:
         return
+    if not await ensure_subscription(update, context):
+        return
 
     service = get_service(context)
     user_data = context.user_data
@@ -1348,6 +1718,37 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 context,
                 ticket_id,
                 info="Ответ администратора отправлен.",
+            )
+        return
+
+    subscription_state = user_data.get("awaiting_subscription_target")
+    if subscription_state:
+        if not is_admin_user:
+            user_data.pop("awaiting_subscription_target", None)
+        else:
+            if not message.text:
+                await message.reply_text(
+                    "Отправьте @username, числовой ID или ссылку, либо «отмена»."
+                )
+                return
+            raw = message.text.strip()
+            if raw.lower() in {"отмена", "cancel"}:
+                user_data.pop("awaiting_subscription_target", None)
+                await message.reply_text("Изменение ссылки отменено.")
+                await show_admin_menu(update, context)
+                return
+            try:
+                chat_id, invite_link = _parse_subscription_input(raw)
+            except ValueError as exc:
+                await message.reply_text(str(exc))
+                return
+            service.update_subscription_requirement(chat_id, invite_link)
+            user_data.pop("awaiting_subscription_target", None)
+            await message.reply_text("✅ Требование подписки обновлено.")
+            await show_admin_menu(
+                update,
+                context,
+                info="Настройки подписки обновлены.",
             )
         return
 
@@ -1808,9 +2209,10 @@ def admin_menu_keyboard(paused: bool) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("⚙️ Цены", callback_data="admin:prices"),
             ],
             [
+                InlineKeyboardButton("🔗 Подписка", callback_data="admin:subscription"),
                 InlineKeyboardButton("💳 CryptoPay", callback_data="admin:cryptopay"),
-                InlineKeyboardButton("🔄 Обновить", callback_data="admin:refresh"),
             ],
+            [InlineKeyboardButton("🔄 Обновить", callback_data="admin:refresh")],
             [InlineKeyboardButton("⬅️ В меню", callback_data="action:menu")],
         ]
     )
@@ -2071,6 +2473,9 @@ async def show_admin_menu(
             await update.message.reply_text("Доступ запрещён.")
         return
 
+    if not await ensure_subscription(update, context):
+        return
+
     service = get_service(context)
     paused = service.is_autopost_paused()
     header = "🎛 Админ-панель\n\n"
@@ -2093,6 +2498,9 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = update.effective_user.id if update.effective_user else None
     if not is_admin_id(user_id, context):
         await query.answer("Доступ запрещён", show_alert=True)
+        return
+
+    if not await ensure_subscription(update, context):
         return
 
     parts = query.data.split(":")
@@ -2214,6 +2622,68 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
             f"• В ожидании: {summary['revenue_waiting']:.2f}"
         )
         await show_admin_menu(update, context, info=info)
+    elif action == "subscription":
+        settings = service.get_settings()
+        context.user_data.pop("awaiting_subscription_target", None)
+        requirement = settings.subscription_chat_id
+        link = settings.subscription_invite_link or _subscription_link(settings)
+        lines = ["🔗 <b>Проверка подписки</b>"]
+        if requirement:
+            lines.append(
+                f"• Проверяется подписка на: <code>{html.escape(str(requirement))}</code>"
+            )
+            if link:
+                safe_link = html.escape(link, quote=True)
+                lines.append(f"• Ссылка для пользователей: <a href=\"{safe_link}\">{safe_link}</a>")
+            lines.append("")
+            lines.append(
+                "Пользователи должны быть подписаны на канал, чтобы пользоваться ботом."
+            )
+        else:
+            lines.append("• Проверка подписки <b>отключена</b>.")
+            lines.append("")
+            lines.append("Укажите канал, чтобы активировать проверку.")
+        lines.append("")
+        lines.append(
+            "Отправьте @username, числовой ID или ссылку формата https://t.me/... для обновления."
+        )
+        keyboard_rows = [
+            [
+                InlineKeyboardButton(
+                    "✏️ Изменить ссылку", callback_data="admin:set_subscription"
+                )
+            ]
+        ]
+        if requirement:
+            keyboard_rows.append(
+                [
+                    InlineKeyboardButton(
+                        "🚫 Отключить проверку", callback_data="admin:clear_subscription"
+                    )
+                ]
+            )
+        keyboard_rows.append(
+            [InlineKeyboardButton("⬅️ Назад", callback_data="admin:refresh")]
+        )
+        await query.message.edit_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    elif action == "set_subscription":
+        context.user_data["awaiting_subscription_target"] = True
+        await query.message.edit_text(
+            "Отправьте @username или числовой ID канала.\n"
+            "Можно указать ссылку после пробела: «@channel https://t.me/channel».\n"
+            "Напишите «отмена», чтобы выйти без изменений.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data="admin:subscription")]]
+            ),
+        )
+    elif action == "clear_subscription":
+        service.update_subscription_requirement(None, None)
+        await show_admin_menu(update, context, info="✅ Проверка подписки отключена.")
     elif action == "prices":
         settings = service.get_settings()
         info = (
@@ -2365,6 +2835,9 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ensure_dependencies(context)
+    if not await ensure_subscription(update, context):
+        return
     await show_admin_menu(update, context)
 
 
@@ -2432,9 +2905,10 @@ def admin_menu_keyboard(paused: bool) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🗂 Заявки", callback_data="admin:requests"),
             ],
             [
+                InlineKeyboardButton("🔗 Подписка", callback_data="admin:subscription"),
                 InlineKeyboardButton("💳 CryptoPay", callback_data="admin:cryptopay"),
-                InlineKeyboardButton("🔄 Обновить", callback_data="admin:refresh"),
             ],
+            [InlineKeyboardButton("🔄 Обновить", callback_data="admin:refresh")],
             [InlineKeyboardButton("⬅️ В меню", callback_data="action:menu")],
         ]
     )
@@ -2453,6 +2927,9 @@ async def show_admin_menu(
             await update.callback_query.answer("Доступ запрещён", show_alert=True)
         else:
             await update.message.reply_text("Доступ запрещён.")
+        return
+
+    if not await ensure_subscription(update, context):
         return
 
     service = get_service(context)
@@ -2477,6 +2954,9 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = update.effective_user.id if update.effective_user else None
     if not is_admin_id(user_id, context):
         await query.answer("Доступ запрещён", show_alert=True)
+        return
+
+    if not await ensure_subscription(update, context):
         return
 
     action = query.data.split(":", 1)[1]
@@ -2524,6 +3004,68 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
             f"• В ожидании: {summary['revenue_waiting']:.2f}"
         )
         await show_admin_menu(update, context, info=info)
+    elif action == "subscription":
+        settings = service.get_settings()
+        context.user_data.pop("awaiting_subscription_target", None)
+        requirement = settings.subscription_chat_id
+        link = settings.subscription_invite_link or _subscription_link(settings)
+        lines = ["🔗 <b>Проверка подписки</b>"]
+        if requirement:
+            lines.append(
+                f"• Проверяется подписка на: <code>{html.escape(str(requirement))}</code>"
+            )
+            if link:
+                safe_link = html.escape(link, quote=True)
+                lines.append(f"• Ссылка для пользователей: <a href=\"{safe_link}\">{safe_link}</a>")
+            lines.append("")
+            lines.append(
+                "Пользователи должны быть подписаны на канал, чтобы пользоваться ботом."
+            )
+        else:
+            lines.append("• Проверка подписки <b>отключена</b>.")
+            lines.append("")
+            lines.append("Укажите канал, чтобы активировать проверку.")
+        lines.append("")
+        lines.append(
+            "Нажмите «Изменить ссылку», чтобы задать канал, или отключите проверку."
+        )
+        keyboard_rows = [
+            [
+                InlineKeyboardButton(
+                    "✏️ Изменить ссылку", callback_data="admin:set_subscription"
+                )
+            ]
+        ]
+        if requirement:
+            keyboard_rows.append(
+                [
+                    InlineKeyboardButton(
+                        "🚫 Отключить проверку", callback_data="admin:clear_subscription"
+                    )
+                ]
+            )
+        keyboard_rows.append(
+            [InlineKeyboardButton("⬅️ Назад", callback_data="admin:refresh")]
+        )
+        await query.message.edit_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    elif action == "set_subscription":
+        context.user_data["awaiting_subscription_target"] = True
+        await query.message.edit_text(
+            "Отправьте @username или числовой ID канала.\n"
+            "Можно добавить ссылку после пробела, например: «@channel https://t.me/channel».\n"
+            "Напишите «отмена», чтобы выйти без изменений.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data="admin:subscription")]]
+            ),
+        )
+    elif action == "clear_subscription":
+        service.update_subscription_requirement(None, None)
+        await show_admin_menu(update, context, info="✅ Проверка подписки отключена.")
     elif action == "requests":
         pending_posts = service.list_pending_posts()
         if not pending_posts:
@@ -2557,4 +3099,7 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ensure_dependencies(context)
+    if not await ensure_subscription(update, context):
+        return
     await show_admin_menu(update, context)

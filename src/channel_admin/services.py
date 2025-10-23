@@ -454,3 +454,13 @@ class ChannelEconomyService:
         self.storage.save_settings(settings)
         self.apply_settings(settings)
         return settings
+
+    def update_subscription_requirement(
+        self, chat_id: str | None, invite_link: str | None
+    ) -> BotSettings:
+        settings = self.storage.get_settings()
+        settings.subscription_chat_id = chat_id
+        settings.subscription_invite_link = invite_link
+        self.storage.save_settings(settings)
+        self.apply_settings(settings)
+        return settings
