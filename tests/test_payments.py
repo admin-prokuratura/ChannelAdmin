@@ -87,6 +87,31 @@ def test_get_invoice_accepts_list_result(monkeypatch: pytest.MonkeyPatch) -> Non
     assert invoice.status == "paid"
 
 
+def test_get_invoice_accepts_nested_list_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {
+        "ok": True,
+        "result": [
+            [
+                {
+                    "invoice_id": "202",
+                    "pay_url": "https://pay.crypt.bot/invoice/202",
+                    "amount": "10.00",
+                    "asset": "TON",
+                    "status": "active",
+                }
+            ]
+        ],
+    }
+    _patch_session(monkeypatch, payload)
+
+    client = CryptoPayClient(token="token")
+    invoice = asyncio.run(client.get_invoice(202))
+
+    assert invoice.invoice_id == 202
+    assert invoice.asset == "TON"
+    assert invoice.status == "active"
+
+
 def test_get_invoice_accepts_dict_result(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = {
         "ok": True,

@@ -149,22 +149,34 @@ class CryptoPayClient:
 
         raw_results = payload_json.get("result") or []
         if isinstance(raw_results, dict):
-            results = list(raw_results.values())
+            candidates = list(raw_results.values())
         elif isinstance(raw_results, list):
-            results = raw_results
+            candidates = raw_results
         else:
-            results = []
+            candidates = []
 
-        if not results:
+        results: list[Any] = []
+        for item in candidates:
+            if isinstance(item, list):
+                results.extend(item)
+            else:
+                results.append(item)
+
+        invoice_payload: Any | None = None
+        for item in results:
+            if isinstance(item, dict):
+                invoice_payload = item
+                break
+
+        if not isinstance(invoice_payload, dict):
             raise CryptoPayError(f"Invoice {invoice_id} not found")
 
-        result = results[0]
         return CryptoPayInvoice(
-            invoice_id=int(result["invoice_id"]),
-            pay_url=str(result["pay_url"]),
-            amount=float(result["amount"]),
-            asset=str(result["asset"]),
-            status=str(result["status"]),
-            description=result.get("description"),
-            payload=result.get("payload"),
+            invoice_id=int(invoice_payload["invoice_id"]),
+            pay_url=str(invoice_payload["pay_url"]),
+            amount=float(invoice_payload["amount"]),
+            asset=str(invoice_payload["asset"]),
+            status=str(invoice_payload["status"]),
+            description=invoice_payload.get("description"),
+            payload=invoice_payload.get("payload"),
         )
