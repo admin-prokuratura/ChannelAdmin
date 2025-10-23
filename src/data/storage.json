@@ -46,5 +46,7 @@
     "energy_price_per_unit": 1.0
   },
   "ticket_sequence": 2,
-  "ticket_message_sequence": 3
+  "ticket_message_sequence": 3,
+  "chimera_records": {},
+  "chimera_sequence": 1
 }

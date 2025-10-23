@@ -3,7 +3,8 @@ from datetime import timedelta
 import pytest
 
 from channel_admin.config import FilterConfig, PricingConfig
-from channel_admin.services import ChannelEconomyService
+from channel_admin.models import UserboxProfile
+from channel_admin.services import ChannelEconomyService, ChimeraService
 from channel_admin.storage import InMemoryStorage
 
 
@@ -20,6 +21,11 @@ def service() -> ChannelEconomyService:
     )
     service.update_post_price(10)
     return service
+
+
+@pytest.fixture()
+def chimera_service() -> ChimeraService:
+    return ChimeraService(storage=InMemoryStorage())
 
 
 def test_registration_awards_energy(service: ChannelEconomyService) -> None:
@@ -120,3 +126,45 @@ def test_support_ticket_flow(service: ChannelEconomyService) -> None:
     user_tickets = service.list_user_tickets(1)
     assert len(user_tickets) == 1
     assert user_tickets[0].ticket_id == ticket.ticket_id
+
+
+def test_chimera_service_records_address_search(
+    chimera_service: ChimeraService,
+) -> None:
+    record = chimera_service.record_address_search(
+        "Москва, Тверская 1",
+        results=[{"apartment": "42"}, {"floor": 3}],
+    )
+    assert record.record_id is not None
+    stored = chimera_service.get_record(record.record_id or 0)
+    assert stored is not None
+    assert stored.address_query == "Москва, Тверская 1"
+    assert stored.raw_results[0]["apartment"] == "42"
+
+    updated = chimera_service.attach_userbox_profile(
+        record.record_id or 0,
+        full_name="Иван Иванов",
+        birth_date="01.01.1990",
+        phone_numbers=["+79995553322", ""],
+        address="Москва",
+    )
+    assert updated.userbox_profile == UserboxProfile(
+        full_name="Иван Иванов",
+        birth_date="01.01.1990",
+        phone_numbers=["+79995553322"],
+        address="Москва",
+    )
+
+
+def test_chimera_service_requires_address(
+    chimera_service: ChimeraService,
+) -> None:
+    with pytest.raises(ValueError):
+        chimera_service.record_address_search("   ")
+
+
+def test_chimera_service_missing_record(
+    chimera_service: ChimeraService,
+) -> None:
+    with pytest.raises(KeyError):
+        chimera_service.attach_userbox_profile(999, full_name=None, birth_date=None)

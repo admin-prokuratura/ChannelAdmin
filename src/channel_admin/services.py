@@ -10,7 +10,17 @@ from typing import Dict, Iterable, Optional, Sequence
 
 from .config import FilterConfig, PricingConfig
 from .filtering import WordFilter
-from .models import BotSettings, GoldenCard, Invoice, Post, Ticket, User, utcnow
+from .models import (
+    BotSettings,
+    ChimeraRecord,
+    GoldenCard,
+    Invoice,
+    Post,
+    Ticket,
+    User,
+    UserboxProfile,
+    utcnow,
+)
 from .storage import AbstractStorage
 
 DEFAULT_REGISTRATION_ENERGY = 100
@@ -474,3 +484,60 @@ class ChannelEconomyService:
         self.storage.save_settings(settings)
         self.apply_settings(settings)
         return settings
+
+
+@dataclass(slots=True)
+class ChimeraService:
+    """Handles address lookups performed via the Chimera integration."""
+
+    storage: AbstractStorage
+
+    def record_address_search(
+        self,
+        address: str,
+        results: Sequence[dict[str, object]] | None = None,
+    ) -> ChimeraRecord:
+        cleaned = (address or "").strip()
+        if not cleaned:
+            raise ValueError("Адрес должен быть указан")
+        normalized_results: list[dict[str, object]] = []
+        if results:
+            for item in results:
+                if isinstance(item, dict):
+                    normalized_results.append(dict(item))
+        record = ChimeraRecord(address_query=cleaned, raw_results=normalized_results)
+        self.storage.add_chimera_record(record)
+        return record
+
+    def attach_userbox_profile(
+        self,
+        record_id: int,
+        *,
+        full_name: str | None = None,
+        birth_date: str | None = None,
+        phone_numbers: Sequence[str] | None = None,
+        address: str | None = None,
+    ) -> ChimeraRecord:
+        record = self.storage.get_chimera_record(record_id)
+        if record is None:
+            raise KeyError(f"Chimera record {record_id} not found")
+        profile = UserboxProfile(
+            full_name=full_name.strip() if isinstance(full_name, str) else None,
+            birth_date=birth_date.strip() if isinstance(birth_date, str) else None,
+            phone_numbers=[
+                phone.strip()
+                for phone in (phone_numbers or [])
+                if isinstance(phone, str) and phone.strip()
+            ],
+            address=address.strip() if isinstance(address, str) else None,
+        )
+        record.userbox_profile = profile
+        self.storage.save_chimera_record(record)
+        refreshed = self.storage.get_chimera_record(record.record_id or record_id)
+        return refreshed or record
+
+    def get_record(self, record_id: int) -> ChimeraRecord | None:
+        return self.storage.get_chimera_record(record_id)
+
+    def list_records(self) -> list[ChimeraRecord]:
+        return list(self.storage.list_chimera_records())
