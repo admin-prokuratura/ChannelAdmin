@@ -120,3 +120,5 @@ class BotSettings:
     autopost_paused: bool = False
     post_energy_cost: int = 20
     energy_price_per_unit: float = 1.0
+    subscription_chat_id: str | None = None
+    subscription_invite_link: str | None = None

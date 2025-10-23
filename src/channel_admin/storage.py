@@ -279,6 +279,8 @@ def _serialize_settings(settings: BotSettings) -> dict:
         "autopost_paused": settings.autopost_paused,
         "post_energy_cost": settings.post_energy_cost,
         "energy_price_per_unit": settings.energy_price_per_unit,
+        "subscription_chat_id": settings.subscription_chat_id,
+        "subscription_invite_link": settings.subscription_invite_link,
     }
 
 
@@ -295,6 +297,8 @@ def _deserialize_settings(payload: dict | None) -> BotSettings:
             payload.get("energy_price_per_unit", BotSettings.energy_price_per_unit),
             BotSettings.energy_price_per_unit,
         ),
+        subscription_chat_id=payload.get("subscription_chat_id"),
+        subscription_invite_link=payload.get("subscription_invite_link"),
     )
 
 
