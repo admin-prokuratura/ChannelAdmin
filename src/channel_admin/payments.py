@@ -7,6 +7,16 @@ from typing import Any
 
 import aiohttp
 
+
+def _extract_error_message(payload: dict[str, Any]) -> str | None:
+    """Return the most helpful error message from a Crypto Pay response."""
+
+    for key in ("error", "description", "message"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
 API_BASE_URL = "https://pay.crypt.bot/api"
 
 
@@ -58,17 +68,36 @@ class CryptoPayClient:
 
         headers = {"Crypto-Pay-API-Token": self.token}
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{self.api_base}/createInvoice",
-                headers=headers,
-                json=request_body,
-            ) as response:
-                response.raise_for_status()
-                payload_json = await response.json()
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.api_base}/createInvoice",
+                    headers=headers,
+                    json=request_body,
+                ) as response:
+                    try:
+                        payload_json = await response.json()
+                    except aiohttp.ContentTypeError as exc:
+                        text = await response.text()
+                        raise CryptoPayError(
+                            "Unexpected response from Crypto Pay: {text}".format(
+                                text=text.strip() or response.reason or response.status
+                            )
+                        ) from exc
+                    status = response.status
+                    reason = response.reason
+        except aiohttp.ClientError as exc:
+            raise CryptoPayError(f"Failed to contact Crypto Pay: {exc}") from exc
+
+        if status >= 400:
+            message = _extract_error_message(payload_json)
+            if message is None:
+                message = reason or f"HTTP error {status}"
+            raise CryptoPayError(message)
 
         if not payload_json.get("ok", False):
-            raise CryptoPayError(payload_json.get("error", "Crypto Pay request failed"))
+            message = _extract_error_message(payload_json) or "Crypto Pay request failed"
+            raise CryptoPayError(message)
 
         result = payload_json["result"]
         return CryptoPayInvoice(
@@ -87,17 +116,36 @@ class CryptoPayClient:
         headers = {"Crypto-Pay-API-Token": self.token}
         request_body = {"invoice_ids": [invoice_id]}
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{self.api_base}/getInvoices",
-                headers=headers,
-                json=request_body,
-            ) as response:
-                response.raise_for_status()
-                payload_json = await response.json()
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.api_base}/getInvoices",
+                    headers=headers,
+                    json=request_body,
+                ) as response:
+                    try:
+                        payload_json = await response.json()
+                    except aiohttp.ContentTypeError as exc:
+                        text = await response.text()
+                        raise CryptoPayError(
+                            "Unexpected response from Crypto Pay: {text}".format(
+                                text=text.strip() or response.reason or response.status
+                            )
+                        ) from exc
+                    status = response.status
+                    reason = response.reason
+        except aiohttp.ClientError as exc:
+            raise CryptoPayError(f"Failed to contact Crypto Pay: {exc}") from exc
+
+        if status >= 400:
+            message = _extract_error_message(payload_json)
+            if message is None:
+                message = reason or f"HTTP error {status}"
+            raise CryptoPayError(message)
 
         if not payload_json.get("ok", False):
-            raise CryptoPayError(payload_json.get("error", "Crypto Pay request failed"))
+            message = _extract_error_message(payload_json) or "Crypto Pay request failed"
+            raise CryptoPayError(message)
 
         raw_results = payload_json.get("result") or []
         if isinstance(raw_results, dict):
