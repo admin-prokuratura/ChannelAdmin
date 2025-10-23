@@ -362,6 +362,16 @@ class ChannelEconomyService:
         self.storage.save_post(post)
         return post
 
+    def update_post_parse_mode(
+        self, post_id: int, parse_mode: Optional[str]
+    ) -> Optional[Post]:
+        post = self.storage.get_post(post_id)
+        if not post:
+            return None
+        post.parse_mode = parse_mode
+        self.storage.save_post(post)
+        return post
+
     def get_settings(self) -> BotSettings:
         return self.storage.get_settings()
 
