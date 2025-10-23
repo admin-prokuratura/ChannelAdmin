@@ -1231,6 +1231,7 @@ async def handle_invoice_check(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if stored_invoice.status.lower() in PAID_INVOICE_STATUSES:
+        await query.answer()
         await query.message.edit_text(
             "✅ Счёт уже оплачен. Спасибо!",
             reply_markup=InlineKeyboardMarkup(
@@ -1287,6 +1288,7 @@ async def handle_invoice_check(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         message = "✅ Оплата подтверждена."
 
+    await query.answer()
     await query.message.edit_text(
         message,
         reply_markup=InlineKeyboardMarkup(
